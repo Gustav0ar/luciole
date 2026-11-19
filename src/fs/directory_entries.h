@@ -74,8 +74,6 @@ namespace luciole {
     // A symlink whose target is a folder. Only local sessions learn this, after they publish the listing; they set
     // it with setLinksToDirectory().
     bool linksToDirectory = false;
-    // Local listings leave access read/write/execute unknown; entryAccess() asks the filesystem when they matter.
-    bool accessDeferred = false;
     // A browse catalogue knows the name/kind before its worker has queried detailed facts.
     bool metadataPending = false;
     bool metadataFailed = false;

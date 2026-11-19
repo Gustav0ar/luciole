@@ -1,7 +1,8 @@
 #include "fs/folder_totals.h"
 
-#include "fs/background_job.h"
 #include "fs/folder_totals_walk.h"
+#include "fs/network_info.h"
+#include "fs/network_job.h"
 
 #include <algorithm>
 #include <glib.h>
@@ -92,13 +93,18 @@ bool luciole::FolderTotalsService::start(std::span<const DirectoryEntry> entries
   state->progress->value = state->snapshot;
   state->running = true;
   state->startTimer();
-  runJob<FolderTotalsSnapshot>(
-      state->cancel,
+  const auto lane =
+      std::ranges::any_of(roots, [](const auto& entry) { return ioLane(entry.location()) == IoLane::Network; })
+      ? IoLane::Network
+      : IoLane::Native;
+  runIoJob<FolderTotalsSnapshot>(
+      lane, state->cancel,
       [roots = std::move(roots), token = state->cancel, progress = state->progress, limited = state->snapshot.limited,
        check = state->check, sameDevice = state->sameDeviceOnly] mutable {
+        // A root on a network lane is a network filesystem; asking the check would touch a possibly stalled share.
         if (check && std::ranges::any_of(roots, [&check](const auto& root) {
               const auto native = root.location().nativePath();
-              return native && check(*native);
+              return native && (ioLane(root.location()) == IoLane::Network || check(*native));
             })) {
           FolderTotalsSnapshot snapshot;
           snapshot.phase = FolderTotalsPhase::Unsupported;
