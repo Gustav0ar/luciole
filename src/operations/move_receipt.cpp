@@ -40,29 +40,29 @@ bool luciole::MoveEffect::usesMount(const HistoryMount& mount) const {
 
 std::shared_ptr<const luciole::MoveReceipt>
 luciole::MoveReceipt::withoutPredecessors(std::shared_ptr<const MoveReceipt> receipt) {
-  if (!receipt) {
-    return {};
-  }
-  if (const auto copied = std::dynamic_pointer_cast<const CopiedMoveReceipt>(receipt)) {
+  return receipt ? receipt->withoutPredecessorsSelf(std::move(receipt)) : nullptr;
+}
+
+std::shared_ptr<const luciole::MoveReceipt>
+luciole::MoveReceipt::withoutPredecessorsSelf(std::shared_ptr<const MoveReceipt> self) const {
+  if (const auto copied = std::dynamic_pointer_cast<const CopiedMoveReceipt>(self)) {
     return copied->withoutPredecessors();
   }
-  if (receipt->m_undone || !std::ranges::any_of(receipt->m_effects, [](const auto& effect) {
-        return effect->m_previous || effect->m_retained;
-      })) {
-    return receipt;
+  if (m_undone
+      || !std::ranges::any_of(m_effects, [](const auto& effect) { return effect->m_previous || effect->m_retained; })) {
+    return self;
   }
-  if (receipt->m_sequence
-      || std::ranges::any_of(receipt->m_effects, [](const auto& effect) { return effect->m_retained != nullptr; })) {
+  if (m_sequence || std::ranges::any_of(m_effects, [](const auto& effect) { return effect->m_retained != nullptr; })) {
     return {};
   }
-  for (const auto& effect : receipt->m_effects) {
-    if (effect->m_previous && std::ranges::any_of(receipt->m_effects, [&](const auto& ancestor) {
+  for (const auto& effect : m_effects) {
+    if (effect->m_previous && std::ranges::any_of(m_effects, [&](const auto& ancestor) {
           return ancestor != effect && ancestor->encloses(effect->m_destination);
         })) {
       return {};
     }
   }
-  auto result = std::make_shared<MoveReceipt>(*receipt);
+  auto result = std::make_shared<MoveReceipt>(*this);
   for (auto& effect : result->m_effects) {
     if (effect->m_previous) {
       auto incoming = std::shared_ptr<MoveEffect>(new MoveEffect(*effect));
@@ -910,7 +910,7 @@ std::size_t luciole::transferHistoryBudget(std::size_t descriptorsPerRoot) {
   return static_cast<std::size_t>(std::min<rlim_t>(4096, (limit.rlim_cur - used - 128) / descriptorsPerRoot));
 }
 
-std::vector<luciole::TransferResult> luciole::MoveReceipt::unconfirmed(const FileError& error) const {
+std::vector<luciole::TransferResult> luciole::MoveReceipt::failedLocations(const FileError& error) const {
   std::vector<TransferResult> results;
   for (const auto& effect : m_effects) {
     auto& result = results.emplace_back(effect->m_destination, TransferOutcome::Partial, error);
@@ -924,4 +924,8 @@ std::vector<luciole::TransferResult> luciole::MoveReceipt::unconfirmed(const Fil
         + result.error->message;
   }
   return results;
+}
+
+std::vector<luciole::TransferResult> luciole::MoveReceipt::unconfirmed(const FileError& error) const {
+  return failedLocations(error);
 }

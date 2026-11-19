@@ -5,7 +5,8 @@
 #include "app/page/submenu_controller.h"
 #include "browser/browser_controller.h"
 #include "config/settings.h"
-#include "fs/background_job.h"
+#include "fs/network_info.h"
+#include "fs/network_job.h"
 #include "platform/desktop_integration.h"
 #include "render/scene/input_dispatcher.h"
 #include "ui/browser/file_error_text.h"
@@ -40,8 +41,8 @@ void ProgramController::open(const luciole::ActionRequest& request, std::functio
   const auto token = m_launch;
   ++m_pending;
   const std::weak_ptr<int> lifetime = m_lifetime;
-  luciole::runJob<std::optional<luciole::PreparedProgram>>(
-      token,
+  luciole::runIoJob<std::optional<luciole::PreparedProgram>>(
+      luciole::ioLane(request.targets.front().location), token,
       [location = request.targets.front().location, token] { return luciole::prepareApplication(location, token); },
       [this, lifetime, request, token, openDocument = std::move(openDocument)](auto result) {
         if (lifetime.expired()) {
@@ -70,8 +71,9 @@ void ProgramController::run(const luciole::ActionRequest& request, bool terminal
   const auto token = m_launch;
   ++m_pending;
   const std::weak_ptr<int> lifetime = m_lifetime;
-  luciole::runJob<luciole::PreparedProgram>(
-      token, [location = request.targets.front().location, token] { return luciole::prepareProgram(location, token); },
+  luciole::runIoJob<luciole::PreparedProgram>(
+      luciole::ioLane(request.targets.front().location), token,
+      [location = request.targets.front().location, token] { return luciole::prepareProgram(location, token); },
       [this, lifetime, request, terminal, token](auto result) {
         if (lifetime.expired()) {
           return;
@@ -165,8 +167,8 @@ void ProgramController::launch(
           --m_pending;
           return;
         }
-        luciole::runJob<bool>(
-            token,
+        luciole::runIoJob<bool>(
+            luciole::operationLane(folder), token,
             [program = std::move(program), folder, arguments = std::move(arguments), terminal,
              activation = std::move(activation), token, terminalCommand = m_page.settings().terminalCommand] {
               luciole::launchProgram(program, folder, arguments, terminal, activation, token, terminalCommand);
@@ -237,8 +239,8 @@ void ProgramController::scripts(const luciole::ActionRequest& request) {
   const auto generation = m_submenus.generation();
   const std::weak_ptr<int> lifetime = m_lifetime;
   ++m_pending;
-  luciole::runJob<luciole::ScriptListing>(
-      token, [token] { return luciole::listScripts(token); },
+  luciole::runIoJob<luciole::ScriptListing>(
+      luciole::scriptsLane(), token, [token] { return luciole::listScripts(token); },
       [this, lifetime, request, generation, token](auto result) {
         if (!lifetime.expired()) {
           --m_pending;
@@ -259,8 +261,8 @@ void ProgramController::openScriptsFolder(const luciole::ActionRequest& request)
   m_launch = luciole::CancelToken{};
   const auto token = m_launch;
   ++m_pending;
-  luciole::runJob<luciole::Location>(
-      token, [token] { return luciole::ensureScriptsDirectory(token); },
+  luciole::runIoJob<luciole::Location>(
+      luciole::scriptsLane(), token, [token] { return luciole::ensureScriptsDirectory(token); },
       [this, lifetime, request](auto result) {
         if (!lifetime.expired()) {
           --m_pending;

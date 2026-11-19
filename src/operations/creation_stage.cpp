@@ -2,6 +2,7 @@
 
 #include "fs/file_error.h"
 #include "fs/gio_ptr.h"
+#include "fs/network_process.h"
 
 #include <algorithm>
 #include <array>
@@ -172,6 +173,7 @@ void luciole::copyCreationData(int source, int output, std::uint64_t size, const
     }
     writeAll(output, buffer.data(), static_cast<std::size_t>(count), token);
     offset += static_cast<std::uint64_t>(count);
+    noteWorkerIoProgress();
   }
 }
 

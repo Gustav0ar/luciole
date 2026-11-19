@@ -2,6 +2,7 @@
 
 #include "fs/background_job.h"
 #include "fs/filename.h"
+#include "fs/network_process.h"
 #include "fs/posix_fd.h"
 #include "operations/copy_history_tree.h"
 #include "operations/creation_stage.h"
@@ -661,11 +662,15 @@ luciole::CopyReceipt::reverse(const CancelToken& token, std::atomic<std::size_t>
 
 std::shared_ptr<const luciole::CopyReceipt>
 luciole::CopyReceipt::withoutPredecessors(std::shared_ptr<const CopyReceipt> receipt) {
-  if (!receipt
-      || !std::ranges::any_of(receipt->m_effects, [](const auto& effect) { return effect->m_previous != nullptr; })) {
-    return receipt;
+  return receipt ? receipt->withoutPredecessorsSelf(std::move(receipt)) : nullptr;
+}
+
+std::shared_ptr<const luciole::CopyReceipt>
+luciole::CopyReceipt::withoutPredecessorsSelf(std::shared_ptr<const CopyReceipt> self) const {
+  if (!std::ranges::any_of(m_effects, [](const auto& effect) { return effect->m_previous != nullptr; })) {
+    return self;
   }
-  auto result = std::make_shared<CopyReceipt>(*receipt);
+  auto result = std::make_shared<CopyReceipt>(*this);
   for (auto& effect : result->m_effects) {
     if (effect->m_previous) {
       effect = std::shared_ptr<const CopyEffect>(
@@ -854,7 +859,7 @@ std::vector<luciole::Location> luciole::CopyEffect::retainForRecovery() const {
   return retained;
 }
 
-std::vector<luciole::TransferResult> luciole::CopyReceipt::unconfirmed(const FileError& error) const {
+std::vector<luciole::TransferResult> luciole::CopyReceipt::failedLocations(const FileError& error) const {
   std::vector<TransferResult> results;
   for (const auto& effect : m_effects) {
     auto& result = results.emplace_back(effect->m_destination, TransferOutcome::Partial, error);
@@ -864,14 +869,25 @@ std::vector<luciole::TransferResult> luciole::CopyReceipt::unconfirmed(const Fil
   return results;
 }
 bool luciole::CopyReceipt::cleanupPending() {
+  if (networkCleanupPending()) {
+    return true;
+  }
   return pendingCleanup.load() != 0 || ProviderCopyReceipt::cleanupPending();
 }
 std::vector<luciole::FileError> luciole::CopyReceipt::takeCleanupErrors() {
+  auto networkErrors = takeNetworkCleanupErrors();
   const std::scoped_lock lock(cleanupMutex);
   auto errors = std::exchange(cleanupErrors, {});
+  errors.insert(
+      errors.end(), std::make_move_iterator(networkErrors.begin()), std::make_move_iterator(networkErrors.end())
+  );
   auto providerErrors = ProviderCopyReceipt::takeCleanupErrors();
   for (auto& error : providerErrors) {
     errors.push_back(std::move(error));
   }
   return errors;
+}
+
+std::vector<luciole::TransferResult> luciole::CopyReceipt::unconfirmed(const FileError& error) const {
+  return failedLocations(error);
 }
