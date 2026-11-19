@@ -94,6 +94,8 @@ namespace luciole {
         TransferAction action, const CancelToken& token
     );
     virtual CopyReplayResult reverse(const CancelToken& token, std::atomic<std::size_t>& completed) const;
+    // Pure affected-location facts; unconfirmed() may also retire a proof and retain data for recovery.
+    virtual std::vector<TransferResult> failedLocations(const FileError& error) const;
     virtual std::vector<TransferResult> unconfirmed(const FileError& error) const;
     virtual std::size_t size() const { return m_effects.size(); }
     virtual bool usesMount(const HistoryMount& mount) const;
@@ -103,6 +105,7 @@ namespace luciole {
 
   protected:
     explicit CopyReceipt(TransferAction action) : m_action(action) {}
+    virtual std::shared_ptr<const CopyReceipt> withoutPredecessorsSelf(std::shared_ptr<const CopyReceipt> self) const;
 
   private:
     friend class CopiedMoveReceipt;

@@ -1,11 +1,13 @@
 #include "fs/directory_session.h"
 
-#include "fs/background_job.h"
 #include "fs/custom_icons.h"
 #include "fs/gio_interop.h"
 #include "fs/heap_trim.h"
 #include "fs/native_listing.h"
+#include "fs/network_info.h"
+#include "fs/network_job.h"
 #include "fs/network_listing.h"
+#include "fs/network_types.h"
 
 #include <algorithm>
 #include <bit>
@@ -83,9 +85,7 @@ namespace {
   constexpr std::chrono::milliseconds kIconSliceInterval{100};
   constexpr std::chrono::milliseconds kMaxIconSliceInterval{1600};
   constexpr std::size_t kIconSliceEntries = 4096;
-  // Following a link can block without end on an unresponsive network or FUSE mount, and cancellation cannot
-  // interrupt it. The link passes of every session share these workers, so hung targets hold at most this many of
-  // GIO's pool threads.
+  // Cap concurrent link passes across sessions. Each pass can wait on an unresponsive target.
   constexpr std::size_t kLinkWorkers = 2;
   // Beyond this many waiting passes the oldest is dropped, and its links keep the kind they were published with.
   constexpr std::size_t kMaxWaitingLinkPasses = 64;
@@ -259,9 +259,7 @@ namespace luciole {
       }
     }
     entry.icon = local
-        ? icons.getLocal(
-              name, g_file_info_get_file_type(info), infoString(info, G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE), *folder
-          )
+        ? icons.getLocal(name, entry.type, infoString(info, G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE), *folder)
         : icons.get(info, *folder);
     if (trashFolder) {
       auto trash = readTrashInfo(info);
@@ -292,6 +290,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
   std::deque<std::size_t> factsOrder;
   FileIconPool icons;
   struct Scan {
+    CancelToken preparation;
     GioPtr<GCancellable> cancellable{g_cancellable_new()};
     GioPtr<GFileEnumerator> enumerator;
     std::vector<DirectoryEntry> entries;
@@ -445,74 +444,101 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
         nullptr, scan->cancellable.get(),
         [](GObject*, GAsyncResult* result, gpointer data) {
           const std::unique_ptr<Request> request(static_cast<Request*>(data));
+          const auto state = request->state.lock();
+          if (!state || state->scan != request->scan) {
+            return;
+          }
           auto& job = *static_cast<Job*>(g_task_get_task_data(G_TASK(result)));
-          if (const auto state = request->state.lock(); state && state->scan == request->scan) {
-            request->scan->factsRunning = false;
-            request->scan->factsInFlight.clear();
-            if (!state->dirty && state->snapshot.entries.sameCatalogue(job.entries)) {
-              if (job.validation.parentChanged || !job.validation.changed.empty()) {
-                if (job.validation.parentChanged) {
-                  state->identities.clear();
-                } else {
-                  for (const auto index : job.validation.changed) {
-                    state->identities.set(job.entries.brief(index).name, std::nullopt);
-                  }
-                }
-                state->begin();
-                return;
-              }
-              for (const auto& [index, entry] : job.facts) {
-                std::erase(state->factsOrder, index);
-                state->factsOrder.push_back(index);
-              }
-              while (state->factsOrder.size() > 1024) {
-                state->factsOrder.pop_front();
-              }
-              std::unordered_map<std::size_t, DirectoryEntry> fresh;
-              for (auto& [index, entry] : job.facts) {
-                const auto icon = state->iconOverrides.find(entry.name);
-                if (icon != state->iconOverrides.end() && (entry.symlink || entry.type == FileType::Directory)) {
-                  entry.icon = icon->second;
-                }
-                fresh.emplace(index, std::move(entry));
-              }
-              std::vector<std::pair<std::size_t, DirectoryEntry>> retained;
-              retained.reserve(state->factsOrder.size());
-              for (const auto index : state->factsOrder) {
-                if (auto found = fresh.find(index); found != fresh.end()) {
-                  retained.emplace_back(index, std::move(found->second));
-                } else if (const auto* entry = state->snapshot.entries.known(index)) {
-                  retained.emplace_back(index, *entry);
-                }
-              }
-              state->snapshot.entries = state->snapshot.entries.withFacts(std::move(retained));
-              state->identities.rebase(state->snapshot.entries);
-              state->notify();
+          if (!g_task_propagate_boolean(G_TASK(result), nullptr)) {
+            job.validation.unavailable = true;
+            for (const auto& [index, details] : job.requests) {
+              const auto brief = job.entries.brief(index);
+              DirectoryEntry entry;
+              entry.place = EntryPlace::inFolder(job.folder);
+              entry.name = brief.name;
+              entry.setDisplayName(std::string(brief.displayName));
+              entry.type = brief.type;
+              entry.symlink = brief.symlink;
+              entry.hidden = brief.hidden;
+              entry.id = brief.id;
+              entry.metadataFailed = true;
+              entry.queriedDetails = EntryDetails::All;
+              job.facts.emplace_back(index, std::move(entry));
             }
-            // The observer can navigate, replace the scan or destroy its session.
-            if (state->scan == request->scan) {
-              state->prepareFacts();
+          }
+          request->scan->factsRunning = false;
+          request->scan->factsInFlight.clear();
+          if (!state->dirty && state->snapshot.entries.sameCatalogue(job.entries)) {
+            if (job.validation.parentChanged || !job.validation.changed.empty()) {
+              if (job.validation.parentChanged) {
+                state->identities.clear();
+              } else {
+                for (const auto index : job.validation.changed) {
+                  state->identities.set(job.entries.brief(index).name, std::nullopt);
+                }
+              }
+              state->begin();
+              return;
             }
+            for (const auto& [index, entry] : job.facts) {
+              std::erase(state->factsOrder, index);
+              state->factsOrder.push_back(index);
+            }
+            while (state->factsOrder.size() > 1024) {
+              state->factsOrder.pop_front();
+            }
+            std::unordered_map<std::size_t, DirectoryEntry> fresh;
+            for (auto& [index, entry] : job.facts) {
+              const auto icon = state->iconOverrides.find(entry.name);
+              if (icon != state->iconOverrides.end() && (entry.symlink || entry.type == FileType::Directory)) {
+                entry.icon = icon->second;
+              }
+              fresh.emplace(index, std::move(entry));
+            }
+            std::vector<std::pair<std::size_t, DirectoryEntry>> retained;
+            retained.reserve(state->factsOrder.size());
+            for (const auto index : state->factsOrder) {
+              if (auto found = fresh.find(index); found != fresh.end()) {
+                retained.emplace_back(index, std::move(found->second));
+              } else if (const auto* entry = state->snapshot.entries.known(index)) {
+                retained.emplace_back(index, *entry);
+              }
+            }
+            state->snapshot.entries = state->snapshot.entries.withFacts(std::move(retained));
+            state->identities.rebase(state->snapshot.entries);
+            state->notify();
+          }
+          // The observer can navigate, replace the scan or destroy its session.
+          if (state->scan == request->scan) {
+            state->prepareFacts();
           }
         },
         new Request{.state = weak_from_this(), .scan = scan}
     );
     g_task_set_task_data(task, job.release(), [](gpointer data) { delete static_cast<Job*>(data); });
-    g_task_run_in_thread(task, [](GTask* task, gpointer, gpointer data, GCancellable* cancellable) {
+    runIoTask(task, ioLane(*scan->folder), [](GTask* task, gpointer, gpointer data, GCancellable* cancellable) {
       auto& job = *static_cast<Job*>(data);
       FileIconPool icons;
       const auto path = job.folder->nativePath();
       icons.setLocalFolder(path ? path->c_str() : nullptr);
+      bool unavailable = false;
       for (const auto& [index, details] : job.requests) {
         if (g_cancellable_is_cancelled(cancellable) != FALSE) {
           break;
         }
         const auto brief = job.entries.brief(index);
-        const auto file = gioFile(job.folder->child(std::string(brief.name)));
         const auto attributes = browseAttributes(details);
-        const GioPtr<GFileInfo> info(
-            g_file_query_info(file.get(), attributes.c_str(), G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, nullptr)
-        );
+        GioPtr<GFileInfo> info;
+        try {
+          if (!unavailable) {
+            info = isolatedInfo(
+                job.folder->child(std::string(brief.name)), attributes.c_str(), G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                cancellationToken(cancellable)
+            );
+          }
+        } catch (const FileErrorException& error) {
+          unavailable = error.error().kind == FileErrorKind::Unavailable;
+        }
         DirectoryEntry entry;
         if (info) {
           entry = readEntry(info.get(), job.folder, icons, true, false);
@@ -535,7 +561,11 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
       for (const auto& [index, details] : job.requests) {
         rows.push_back(index);
       }
-      job.validation = validateCatalogueRows(*job.entries.catalogue(), rows, cancellable);
+      if (unavailable) {
+        job.validation.unavailable = true;
+      } else {
+        job.validation = validateCatalogueRows(*job.entries.catalogue(), rows, cancellable);
+      }
       if (job.validation.unavailable) {
         for (auto& [index, entry] : job.facts) {
           entry.metadataFailed = true;
@@ -548,6 +578,9 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
   }
 
   void stopScan() {
+    if (scan) {
+      scan->preparation.cancel();
+    }
     if (factsIdle != 0) {
       g_source_remove(std::exchange(factsIdle, 0));
     }
@@ -573,7 +606,12 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
       monitorToken->cancel();
     }
     monitorPending = false;
+    stopMonitor();
+  }
+
+  void stopMonitor() {
     if (monitor) {
+      g_signal_handlers_disconnect_by_data(monitor.get(), this);
       g_file_monitor_cancel(monitor.get());
       monitor.reset();
     }
@@ -767,22 +805,11 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
       );
       return;
     }
-    if (!g_file_is_native(file.get())) {
-      snapshot.monitorError = FileError{
-          .kind = FileErrorKind::Unsupported,
-          .message = snapshot.location->isTrash() ? "Refresh to update the Trash view."
-                                                  : "Remote change monitoring is not implemented yet."
-      };
-      return;
-    }
-    GError* error = nullptr;
-    monitor.reset(g_file_monitor_directory(file.get(), G_FILE_MONITOR_WATCH_MOVES, nullptr, &error));
-    if (error != nullptr) {
-      snapshot.monitorError = fileError(*error);
-      g_error_free(error);
-      return;
-    }
-    connectMonitor();
+    snapshot.monitorError = FileError{
+        .kind = FileErrorKind::Unsupported,
+        .message = snapshot.location->isTrash() ? "Refresh to update the Trash view."
+                                                : "Remote change monitoring is not implemented yet."
+    };
   }
 
   void publishNetwork() {
@@ -847,48 +874,99 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
     const GString localPath(scan->local ? g_file_get_path(scan->parent.get()) : nullptr);
     scan->local = scan->local && localPath;
     icons.setLocalFolder(localPath.get());
-    queryMetadata();
     if (scan->local) {
-      listNatively(localPath.get());
+      struct Preparation {
+        bool remote = false;
+        GioPtr<GFileMonitor> monitor;
+        std::optional<FileError> monitorError, filesystemError, accessError;
+        DirectoryMetadata metadata;
+      };
+      runIoJob<Preparation>(
+          ioLane(*snapshot.location), scan->preparation,
+          [location = *snapshot.location, token = scan->preparation, needsMonitor = !monitor] {
+            Preparation result;
+            auto request = filesystemRequest("directoryMetadata", location);
+            request.update({{"filesystem", kFilesystemAttributes}, {"access", kAccessAttributes}});
+            const auto reply = NetworkProcess::acquire(ioLane(location))->call(std::move(request), token);
+            reply.at("filesystem").get_to(result.metadata.filesystem);
+            reply.at("access").get_to(result.metadata.access);
+            reply.at("filesystemError").get_to(result.filesystemError);
+            reply.at("accessError").get_to(result.accessError);
+            result.remote = reply.at("automount").get<bool>() || result.metadata.filesystem.remote == true;
+            if (result.remote) {
+              registerNetworkFolder(location);
+            } else if (result.filesystemError) {
+              result.monitorError = result.filesystemError;
+            } else if (needsMonitor) {
+              GError* error = nullptr;
+              result.monitor.reset(g_file_monitor_directory(
+                  gioFile(location).get(), G_FILE_MONITOR_WATCH_MOVES, gioCancellable(token), &error
+              ));
+              if (const GErrorPtr owned(error); owned) {
+                result.monitorError = fileError(*owned);
+              }
+            }
+            return result;
+          },
+          [weak = weak_from_this(), pending = scan,
+           path = std::string(localPath.get())](JobResult<Preparation> result) {
+            const auto state = weak.lock();
+            if (!state || state->scan != pending || pending->preparation.cancelled()) {
+              if (result && result->monitor) {
+                g_file_monitor_cancel(result->monitor.get());
+              }
+              return;
+            }
+            if (!result) {
+              state->complete(result.error());
+              return;
+            }
+            if (result->remote) {
+              state->stopMonitor();
+              state->snapshot.monitorError =
+                  FileError{FileErrorKind::Unsupported, "Refresh to update this network folder."};
+            } else if (result->monitor) {
+              state->monitor = std::move(result->monitor);
+              state->connectMonitor();
+            } else if (result->monitorError) {
+              state->snapshot.monitorError = std::move(result->monitorError);
+            }
+            pending->metadata = std::move(result->metadata);
+            pending->filesystemError = std::move(result->filesystemError);
+            pending->accessError = std::move(result->accessError);
+            pending->accessPending = pending->filesystemPending = false;
+            state->listNatively(path);
+          }
+      );
     } else {
+      if (!monitor) {
+        watch();
+      }
+      queryMetadata();
       enumerate();
     }
     notify();
   }
 
-  // Local folders: readdir and statx on a worker, published in one step.
+  // Native directory syscalls and any nested mount access stay inside an isolated worker.
   void listNatively(std::string path) {
-    scan->path = path;
-    struct Job {
-      std::string path;
-      std::size_t limit = 0;
-      NativeListing listing;
-      bool catalogue = false;
-    };
-    auto* task = g_task_new(
-        nullptr, scan->cancellable.get(),
-        [](GObject*, GAsyncResult* result, gpointer data) {
-          const std::unique_ptr<Request> request(static_cast<Request*>(data));
-          auto& job = *static_cast<Job*>(g_task_get_task_data(G_TASK(result)));
-          if (const auto state = request->state.lock(); state && state->scan == request->scan) {
-            state->listed(std::move(job.listing));
+    scan->path = std::move(path);
+    runIoJob<NativeListing>(
+        ioLane(*snapshot.location), scan->preparation,
+        [location = *snapshot.location, token = scan->preparation, limit = entryLimit,
+         catalogue = catalogueEnabled && !resolveId] {
+          return isolatedListing(location, kAttributes, limit, catalogue, token);
+        },
+        [weak = weak_from_this(), pending = scan](JobResult<NativeListing> result) {
+          if (const auto state = weak.lock(); state && state->scan == pending) {
+            if (result) {
+              state->listed(std::move(*result));
+            } else {
+              state->complete(result.error());
+            }
           }
-        },
-        new Request{.state = weak_from_this(), .scan = scan}
+        }
     );
-    g_task_set_task_data(
-        task,
-        new Job{
-            .path = std::move(path), .limit = entryLimit, .listing = {}, .catalogue = catalogueEnabled && !resolveId
-        },
-        [](gpointer data) { delete static_cast<Job*>(data); }
-    );
-    g_task_run_in_thread(task, [](GTask* task, gpointer, gpointer data, GCancellable* cancellable) {
-      auto& job = *static_cast<Job*>(data);
-      job.listing = listNativeFolder(job.path, job.limit, cancellable, job.catalogue);
-      g_task_return_boolean(task, TRUE);
-    });
-    g_object_unref(task);
   }
 
   void listed(NativeListing listing) {
@@ -983,63 +1061,64 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
   }
 
   void followLinks() {
-    struct Job {
-      std::string folder;
-      std::shared_ptr<const std::vector<std::pair<std::size_t, std::string>>> links;
-      LinkTargetCheck linksToDirectory;
-      std::unordered_set<std::size_t> directoryLinks;
+    const auto token = cancellationToken(scan->cancellable.get());
+    // Even a link in a local folder can resolve through a disconnected mount.
+    constexpr auto lane = IoLane::NetworkPreviewProbe;
+    struct Followed {
+      std::unordered_set<std::size_t> directories;
       std::vector<std::pair<std::string, FileIconSource>> icons;
-      bool complete = false;
     };
-    auto* task = g_task_new(
-        nullptr, scan->cancellable.get(),
-        [](GObject*, GAsyncResult* result, gpointer data) {
-          const std::unique_ptr<Request> request(static_cast<Request*>(data));
+    runIoJob<Followed>(
+        lane, token,
+        [folder = scan->path, links = scan->links, check = linksToDirectory, token] {
+          Followed result;
+          const auto location = Location::fromPath(folder);
+          const auto entries = std::span(*links);
+          // An injected check runs here and reads link icons as the helper does.
+          const bool readIcons = check && !networkFilesystem(folder);
+          bool mountsKnown = false;
+          const auto knownMounts = configuredSystemMounts(&mountsKnown);
+          const auto& mounts = knownMounts;
+          for (std::size_t first = 0; first < entries.size() && !token.cancelled(); first += 256) {
+            const auto batch = entries.subspan(first, std::min<std::size_t>(256, entries.size() - first));
+            if (check) {
+              for (const auto& [index, name] : batch) {
+                if (token.cancelled()) {
+                  break;
+                }
+                const auto path = std::string(folder).append("/").append(name);
+                if (check(path)) {
+                  result.directories.insert(index);
+                }
+                if (readIcons) {
+                  if (auto icon = linkTargetIcon(path, mounts)) {
+                    result.icons.emplace_back(name, std::move(*icon));
+                  }
+                }
+              }
+            } else {
+              auto request = filesystemRequest("directoryLinks", location);
+              request["links"] = batch;
+              // The helper cannot see the mounts published here, which keep link icons out of idle automounts.
+              request["mounts"] = mountsKnown ? NetworkMessage(knownMounts) : NetworkMessage(nullptr);
+              const auto reply = NetworkProcess::acquire(lane)->call(std::move(request), token);
+              for (const auto& index : reply.at("directories")) {
+                result.directories.insert(index.get<std::size_t>());
+              }
+              for (const auto& icon : reply.at("icons")) {
+                result.icons.emplace_back(icon.at(0).get<std::string>(), icon.at(1).get<FileIconSource>());
+              }
+            }
+          }
+          return result;
+        },
+        [weak = weak_from_this(), listed = scan, token](auto result) {
           LinkWorkers::shared().finished();
-          auto& job = *static_cast<Job*>(g_task_get_task_data(G_TASK(result)));
-          if (const auto state = request->state.lock(); state && state->scan == request->scan && job.complete) {
-            state->linksFollowed(std::move(job.directoryLinks), std::move(job.icons));
-          }
-        },
-        new Request{.state = weak_from_this(), .scan = scan}
-    );
-    g_task_set_task_data(
-        task,
-        new Job{
-            .folder = scan->path,
-            .links = scan->links,
-            .linksToDirectory = linksToDirectory,
-            .directoryLinks = {},
-            .icons = {},
-            .complete = false
-        },
-        [](gpointer data) { delete static_cast<Job*>(data); }
-    );
-    g_task_run_in_thread(task, [](GTask* task, gpointer, gpointer data, GCancellable* cancellable) {
-      auto& job = *static_cast<Job*>(data);
-      const std::string_view separator = job.folder.ends_with('/') ? "" : "/";
-      // Over the network every target icon would cost requests; such links keep their listing's icons.
-      const bool readIcons = !networkFilesystem(job.folder);
-      job.complete = true;
-      for (const auto& [index, name] : *job.links) {
-        if (g_cancellable_is_cancelled(cancellable) != FALSE) {
-          job.complete = false;
-          break;
-        }
-        const auto path = std::string(job.folder).append(separator).append(name);
-        if (job.linksToDirectory(path)) {
-          job.directoryLinks.insert(index);
-        }
-        // The target just answered, so following it again for its icon does not risk a second hung worker.
-        if (readIcons) {
-          if (auto icon = linkTargetIcon(path)) {
-            job.icons.emplace_back(name, std::move(*icon));
+          if (auto state = weak.lock(); state && state->scan == listed && !token.cancelled() && result) {
+            state->linksFollowed(std::move(result->directories), std::move(result->icons));
           }
         }
-      }
-      g_task_return_boolean(task, TRUE);
-    });
-    g_object_unref(task);
+    );
   }
 
   void linksFollowed(
@@ -1118,6 +1197,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
       std::chrono::milliseconds interval{0};
       std::size_t end = 0;
       std::vector<std::pair<std::string, FileIconSource>> icons;
+      bool network = false;
       bool complete = false;
     };
     auto* task = g_task_new(
@@ -1141,6 +1221,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
             .interval = std::exchange(scan->iconInterval, std::min(2 * scan->iconInterval, kMaxIconSliceInterval)),
             .end = scan->iconsChecked,
             .icons = {},
+            .network = ioLane(*scan->folder) == IoLane::Network,
             .complete = false
         },
         [](gpointer data) { delete static_cast<Job*>(data); }
@@ -1149,11 +1230,12 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
       auto& job = *static_cast<Job*>(data);
       job.complete = true;
       // Over the network every folder would cost requests; such folders keep their listing's icons.
-      if (job.begin == 0 && networkFilesystem(job.folder)) {
+      if (job.begin == 0 && (job.network || networkFilesystem(job.folder))) {
         job.end = job.candidates->size();
         g_task_return_boolean(task, TRUE);
         return;
       }
+      const auto mounts = configuredSystemMounts();
       const auto deadline = std::chrono::steady_clock::now() + job.interval;
       const std::string_view separator = job.folder.ends_with('/') ? "" : "/";
       for (job.end = job.begin; job.end < job.candidates->size(); ++job.end) {
@@ -1166,7 +1248,14 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
           break;
         }
         const auto& name = (*job.candidates)[job.end];
-        if (auto icon = customFolderIcon(std::string(job.folder).append(separator).append(name))) {
+        const auto path = std::string(job.folder).append(separator).append(name);
+        // Opening .directory inside a configured automount would activate it while browsing its parent, and a share
+        // mounted on this folder could stall.
+        const auto candidate = Location::fromPath(path);
+        if (automountFor(candidate, mounts) || ioLane(candidate) == IoLane::Network) {
+          continue;
+        }
+        if (auto icon = customFolderIcon(path)) {
           job.icons.emplace_back(name, std::move(*icon));
         }
       }
@@ -1233,9 +1322,9 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
     if (entry.symlink && entry.linksToDirectory) {
       return localFolderIcon();
     }
-    const auto type = entry.symlink         ? G_FILE_TYPE_SYMBOLIC_LINK
-        : entry.type == FileType::Directory ? G_FILE_TYPE_DIRECTORY
-                                            : G_FILE_TYPE_REGULAR;
+    const auto type = entry.symlink         ? FileType::Symlink
+        : entry.type == FileType::Directory ? FileType::Directory
+                                            : FileType::Regular;
     return icons.getLocal(
         entry.name.c_str(), type, entry.contentType ? entry.contentType->c_str() : nullptr, *scan->folder
     );
@@ -1322,6 +1411,11 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
           const std::unique_ptr<Request> request(static_cast<Request*>(data));
           auto& job = *static_cast<Job*>(g_task_get_task_data(G_TASK(result)));
           if (const auto state = request->state.lock(); state && state->scan == request->scan) {
+            if (!g_task_propagate_boolean(G_TASK(result), nullptr)) {
+              state->snapshot.contentTypesPending = false;
+              state->notify();
+              return;
+            }
             state->sniffed(job.begin, job.types);
           }
         },
@@ -1338,12 +1432,14 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
         },
         [](gpointer data) { delete static_cast<Job*>(data); }
     );
-    g_task_run_in_thread(task, [](GTask* task, gpointer, gpointer data, GCancellable* cancellable) {
+    runIoTask(task, ioLane(*scan->folder), [](GTask* task, gpointer, gpointer data, GCancellable* cancellable) {
       auto& job = *static_cast<Job*>(data);
       const auto deadline = std::chrono::steady_clock::now() + job.interval;
       const std::string_view separator = job.folder.ends_with('/') ? "" : "/";
       for (auto i = job.begin; i < job.names->size() && g_cancellable_is_cancelled(cancellable) == FALSE; ++i) {
-        job.types.push_back(sniffContentType(std::string(job.folder).append(separator).append((*job.names)[i])));
+        job.types.push_back(
+            sniffContentType(std::string(job.folder).append(separator).append((*job.names)[i]), cancellable)
+        );
         if (std::chrono::steady_clock::now() >= deadline) {
           break;
         }
@@ -1370,7 +1466,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
         continue;
       }
       entry.contentType = InternedText(*type->second);
-      entry.icon = icons.getLocal(entry.name.c_str(), G_FILE_TYPE_REGULAR, type->second->c_str(), *scan->folder);
+      entry.icon = icons.getLocal(entry.name.c_str(), FileType::Regular, type->second->c_str(), *scan->folder);
       changed = true;
     }
     const auto current = scan;
@@ -1550,11 +1646,17 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
     }
     lastPublished = now;
     const auto replaced = snapshot.entries.size();
-    snapshot.entries =
-        scan->catalogue ? DirectoryEntries(std::move(*scan->catalogue)) : DirectoryEntries(std::move(scan->entries));
-    // Native entries already carry the known link kinds; a catalogue keeps them in an overlay.
-    if (snapshot.entries.isCatalogue() && !scan->directoryLinks.empty()) {
-      snapshot.entries = snapshot.entries.withDirectoryLinks(scan->directoryLinks);
+    if (!error
+        || error->kind != FileErrorKind::Unavailable
+        || !scan->entries.empty()
+        || scan->catalogue
+        || snapshot.entries.empty()) {
+      snapshot.entries =
+          scan->catalogue ? DirectoryEntries(std::move(*scan->catalogue)) : DirectoryEntries(std::move(scan->entries));
+      // Native entries already carry the known link kinds; a catalogue keeps them in an overlay.
+      if (snapshot.entries.isCatalogue() && !scan->directoryLinks.empty()) {
+        snapshot.entries = snapshot.entries.withDirectoryLinks(scan->directoryLinks);
+      }
     }
     unsniffed.clear();
     snapshot.contentTypesPending = !error && !scan->sniff->empty();
@@ -1602,9 +1704,7 @@ luciole::DirectorySession::DirectorySession(
     : m_state(std::make_shared<State>()) {
   m_state->entryLimit = entryLimit;
   m_state->resolveId = std::move(resolveId);
-  m_state->linksToDirectory = linksToDirectory ? std::move(linksToDirectory) : [](const std::string& path) {
-    return luciole::linksToDirectory(path);
-  };
+  m_state->linksToDirectory = std::move(linksToDirectory);
 }
 
 luciole::DirectorySession::~DirectorySession() {
@@ -1626,7 +1726,6 @@ void luciole::DirectorySession::open(const Location& location) {
     state->openNetwork();
     return;
   }
-  state->watch();
   state->begin();
 }
 
@@ -1640,7 +1739,6 @@ void luciole::DirectorySession::refresh() {
   if (state->snapshot.location) {
     if (!state->monitor) {
       state->snapshot.monitorError.reset();
-      state->watch();
       // Changes before this new watch were not observed.
       state->identities.clear();
     }
