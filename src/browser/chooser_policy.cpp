@@ -1,7 +1,8 @@
 #include "browser/chooser_policy.h"
 
+#include "fs/file_query.h"
+
 #include <algorithm>
-#include <sys/stat.h>
 
 namespace {
   using luciole::FileType;
@@ -23,19 +24,21 @@ namespace {
 bool luciole::isLink(const DirectoryEntry& entry) { return entry.symlink || entry.type == FileType::Symlink; }
 
 // Listings report links without following them, so a link counts as its native target's type.
-luciole::FileType luciole::chosenType(const DirectoryEntry& entry) {
+luciole::FileType luciole::chosenType(const DirectoryEntry& entry, const CancelToken& token) {
   if (!isLink(entry)) {
     return entry.type;
   }
-  const auto path = entry.location().nativePath();
-  struct stat info{};
-  if (!path || ::stat(path->c_str(), &info) != 0) {
+  if (!entry.location().isNative()) {
     return FileType::Symlink;
   }
-  if (S_ISDIR(info.st_mode)) {
-    return FileType::Directory;
+  try {
+    return readFileType(entry.location(), token);
+  } catch (const FileErrorException& error) {
+    if (error.error().kind == FileErrorKind::Missing) {
+      return FileType::Symlink;
+    }
+    throw;
   }
-  return S_ISREG(info.st_mode) ? FileType::Regular : FileType::Special;
 }
 
 luciole::ChooserDecision luciole::chooserDecision(
@@ -52,7 +55,7 @@ luciole::ChooserDecision luciole::chooserDecision(
   std::vector<FileType> types;
   types.reserve(entries.size());
   for (const auto& entry : entries) {
-    types.push_back(chosenType(entry));
+    types.push_back(entry.type);
   }
   const auto every = [&](FileType type) {
     return std::ranges::all_of(types, [type](FileType t) { return t == type; });

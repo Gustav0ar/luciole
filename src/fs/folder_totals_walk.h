@@ -2,6 +2,7 @@
 
 #include "fs/cancel_token.h"
 #include "fs/folder_totals.h"
+#include "fs/network_process.h"
 
 namespace luciole {
   struct FolderTotalsLimits {
@@ -9,6 +10,7 @@ namespace luciole {
     // Same-device scope: the walk never descends into a child filesystem; such children count as unsupported.
     bool sameDevice = false;
   };
+  NetworkMessage networkFolderTotals(const NetworkMessage& request, const NetworkEvent& event);
   // Worker entry point. Progress is a bounded value, never a retained per-item result list.
   FolderTotalsSnapshot walkFolderTotals(
       std::vector<DirectoryEntry> roots, const CancelToken& token,

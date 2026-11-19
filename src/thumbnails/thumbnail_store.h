@@ -34,5 +34,6 @@ namespace luciole {
   private:
     std::filesystem::path m_root;
   };
+  std::optional<std::vector<std::uint8_t>> readThumbnailFile(int fd, std::size_t maximum);
   std::optional<std::vector<std::uint8_t>> readThumbnailFile(const std::filesystem::path& path, std::size_t maximum);
 } // namespace luciole

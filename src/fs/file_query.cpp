@@ -1,9 +1,10 @@
 #include "fs/file_query.h"
 
-#include "fs/background_job.h"
 #include "fs/custom_icons.h"
 #include "fs/gio_interop.h"
 #include "fs/native_listing.h"
+#include "fs/network_info.h"
+#include "fs/network_job.h"
 
 #include <cerrno>
 #include <format>
@@ -16,8 +17,9 @@ void luciole::queryEntryIdentities(
     DirectoryEntries entries, std::vector<std::uint64_t> ids, const CancelToken& token,
     std::move_only_function<void(std::expected<EntryIdentities, FileError>)> done
 ) {
-  runJob<EntryIdentities>(
-      token,
+  const auto lane = entries.empty() ? IoLane::Native : ioLane(entries.location(0));
+  runIoJob<EntryIdentities>(
+      lane, token,
       [entries = std::move(entries), ids = std::move(ids), token] {
         EntryIdentities result;
         std::unordered_set<std::uint64_t> wanted(ids.begin(), ids.end());
@@ -54,14 +56,17 @@ void luciole::queryEntryIdentities(
             }
             continue;
           }
-          const auto file = gioFile(entries.location(i));
-          const GioPtr<GFileInfo> info(g_file_query_info(
-              file.get(), G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM,
-              G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, gioCancellable(token), nullptr
-          ));
-          if (info) {
+          try {
+            const auto info = isolatedInfo(
+                entries.location(i), G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM,
+                G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, token
+            );
             if (auto identity = readFileIdentity(info.get())) {
               result.emplace(brief.id, std::move(*identity));
+            }
+          } catch (const FileErrorException& error) {
+            if (error.error().kind != FileErrorKind::Missing && error.error().kind != FileErrorKind::Denied) {
+              throw;
             }
           }
         }
@@ -84,9 +89,8 @@ void luciole::queryEntryIdentities(
 }
 
 luciole::FileDetails luciole::readFileDetails(const Location& location, const CancelToken& token) {
-  GError* rawError = nullptr;
-  const GioPtr<GFileInfo> info(g_file_query_info(
-      gioFile(location).get(),
+  const auto info = isolatedInfo(
+      location,
       G_FILE_ATTRIBUTE_STANDARD_TYPE
       "," G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME "," G_FILE_ATTRIBUTE_STANDARD_SIZE
       "," G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE "," G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE
@@ -95,12 +99,8 @@ luciole::FileDetails luciole::readFileDetails(const Location& location, const Ca
       "," G_FILE_ATTRIBUTE_ETAG_VALUE "," G_FILE_ATTRIBUTE_TIME_CHANGED
       ",time::changed-nsec," G_FILE_ATTRIBUTE_TIME_CHANGED_USEC "," G_FILE_ATTRIBUTE_ID_FILE
       "," G_FILE_ATTRIBUTE_ID_FILESYSTEM "," G_FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
-      G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, gioCancellable(token), &rawError
-  ));
-  const GErrorPtr error(rawError);
-  if (!info) {
-    throw FileErrorException(error ? fileError(*error) : FileError{FileErrorKind::Other, "Metadata unavailable"});
-  }
+      G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, token
+  );
   FileDetails details;
   if (g_file_info_get_attribute_type(info.get(), G_FILE_ATTRIBUTE_STANDARD_TYPE) == G_FILE_ATTRIBUTE_TYPE_UINT32) {
     details.type = fileType(g_file_info_get_file_type(info.get()));
@@ -135,8 +135,8 @@ void luciole::queryFileDetails(
     const Location& location, const CancelToken& token,
     std::move_only_function<void(std::expected<FileDetails, FileError>)> done
 ) {
-  runJob<FileDetails>(
-      token, [location, token] { return readFileDetails(location, token); },
+  runIoJob<FileDetails>(
+      ioLane(location), token, [location, token] { return readFileDetails(location, token); },
       [token, done = std::move(done)](auto reply) mutable {
         if (!token.cancelled()) {
           done(std::move(reply));
@@ -149,20 +149,16 @@ void luciole::queryFileIcon(
     const Location& location, const CancelToken& token,
     std::move_only_function<void(std::expected<FileIconSource, FileError>)> done
 ) {
-  runJob<FileIconSource>(
-      token,
+  runIoJob<FileIconSource>(
+      ioLane(location), token,
       [location, token] {
-        GError* rawError = nullptr;
-        const GioPtr<GFileInfo> info(g_file_query_info(
-            gioFile(location).get(),
+        const auto info = isolatedInfo(
+            location,
             G_FILE_ATTRIBUTE_STANDARD_TYPE "," G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_ICON,
-            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, gioCancellable(token), &rawError
-        ));
-        const GErrorPtr error(rawError);
-        if (!info) {
-          throw FileErrorException(error ? fileError(*error) : FileError{FileErrorKind::Other, "Icon unavailable"});
-        }
-        if (g_file_info_get_file_type(info.get()) == G_FILE_TYPE_DIRECTORY) {
+            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, token
+        );
+        // A custom icon is read from files in the folder; a network folder keeps the icon GIO reports, as listings do.
+        if (g_file_info_get_file_type(info.get()) == G_FILE_TYPE_DIRECTORY && ioLane(location) == IoLane::Native) {
           if (const auto path = location.nativePath()) {
             if (auto custom = customFolderIcon(*path)) {
               return std::move(*custom);
@@ -179,60 +175,36 @@ void luciole::queryFileIcon(
   );
 }
 
+luciole::FileType luciole::readFileType(const Location& location, const CancelToken& token, FollowSymlinks follow) {
+  const auto info = isolatedInfo(
+      location, G_FILE_ATTRIBUTE_STANDARD_TYPE,
+      follow == FollowSymlinks::Yes ? G_FILE_QUERY_INFO_NONE : G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, token
+  );
+  return fileType(g_file_info_get_file_type(info.get()));
+}
+
 void luciole::queryFileType(
     const Location& location, const CancelToken& token,
     std::move_only_function<void(std::expected<FileType, FileError>)> done
 ) {
-  if (const auto path = location.nativePath()) {
-    runJob<FileType>(
-        token,
-        [path = *path, token] {
-          if (token.cancelled()) {
-            throwFileError(FileErrorKind::Cancelled, "Cancelled");
-          }
-          struct stat info{};
-          if (::stat(path.c_str(), &info) < 0) {
-            const auto error = errnoError(errno);
-            throw FileErrorException({error.kind, "Cannot open symbolic link target: " + error.message});
-          }
-          return S_ISDIR(info.st_mode) ? FileType::Directory
-              : S_ISREG(info.st_mode)  ? FileType::Regular
-                                       : FileType::Special;
-        },
-        [token, done = std::move(done)](auto reply) mutable {
-          if (!token.cancelled()) {
-            done(std::move(reply));
-          }
+  runIoJob<FileType>(
+      ioLane(location), token,
+      [location, token] {
+        const auto type = readFileType(location, token);
+        // Following a link that still reports a link means its target is missing or loops.
+        if (type == FileType::Symlink) {
+          throw FileErrorException(
+              {FileErrorKind::Unavailable,
+               "The symbolic link target is unavailable. It may be missing or contain a link loop."}
+          );
         }
-    );
-    return;
-  }
-  using Done = std::move_only_function<void(std::expected<FileType, FileError>)>;
-  const auto file = gioFile(location);
-  g_file_query_info_async(
-      file.get(), G_FILE_ATTRIBUTE_STANDARD_TYPE, G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT, gioCancellable(token),
-      [](GObject* source, GAsyncResult* result, gpointer raw) {
-        const std::unique_ptr<Done> done(static_cast<Done*>(raw));
-        GError* rawError = nullptr;
-        const GioPtr<GFileInfo> info(g_file_query_info_finish(G_FILE(source), result, &rawError));
-        const GErrorPtr error(rawError);
-        if (error && g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-          return;
-        }
-        if (error) {
-          (*done)(std::unexpected(fileError(*error)));
-        } else if (g_file_info_get_file_type(info.get()) == G_FILE_TYPE_SYMBOLIC_LINK) {
-          (*done)(std::unexpected(
-              FileError{
-                  FileErrorKind::Unavailable,
-                  "The symbolic link target is unavailable. It may be missing or contain a link loop."
-              }
-          ));
-        } else {
-          (*done)(fileType(g_file_info_get_file_type(info.get())));
-        }
+        return type;
       },
-      new Done(std::move(done))
+      [token, done = std::move(done)](JobResult<FileType> result) mutable {
+        if (!token.cancelled()) {
+          done(std::move(result));
+        }
+      }
   );
 }
 
@@ -272,38 +244,27 @@ void luciole::queryFilesystemFacts(
 std::optional<luciole::FileError> luciole::enumerateChildren(
     const Location& parent, const CancelToken& token, const std::function<bool(const ChildInfo&)>& visit
 ) {
-  auto* cancellable = gioCancellable(token);
-  GError* raw = nullptr;
-  const GioPtr<GFileEnumerator> enumerator(g_file_enumerate_children(
-      gioFile(parent).get(),
-      G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE
-                                     "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN,
-      G_FILE_QUERY_INFO_NONE, cancellable, &raw
-  ));
-  while (enumerator && !g_cancellable_is_cancelled(cancellable)) {
-    const GioPtr<GFileInfo> info(g_file_enumerator_next_file(enumerator.get(), cancellable, &raw));
-    if (!info) {
-      break;
+  try {
+    isolatedChildren(
+        parent,
+        G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE
+                                       "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN,
+        G_FILE_QUERY_INFO_NONE, token, [&](GFileInfo* info) {
+          const char* name = g_file_info_get_name(info);
+          const char* display = g_file_info_get_display_name(info);
+          return visit(
+              {.name = name,
+               .displayName = display ? display : name,
+               .type = fileType(g_file_info_get_file_type(info)),
+               .hidden = g_file_info_get_is_hidden(info) != FALSE || (name && name[0] == '.')}
+          );
+        }
+    );
+  } catch (...) {
+    auto error = currentFileError();
+    if (error.kind != FileErrorKind::Cancelled) {
+      return error;
     }
-    const char* name = g_file_info_get_name(info.get());
-    const char* display = g_file_info_get_display_name(info.get());
-    const ChildInfo child{
-        .name = name,
-        .displayName = display ? display : name,
-        .type = fileType(g_file_info_get_file_type(info.get())),
-        .hidden = g_file_info_get_attribute_boolean(info.get(), G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN)
-            || (name && name[0] == '.'),
-    };
-    if (!visit(child)) {
-      break;
-    }
-  }
-  const GErrorPtr error(raw);
-  if (enumerator) {
-    g_file_enumerator_close(enumerator.get(), cancellable, nullptr);
-  }
-  if (error && !g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-    return fileError(*error);
   }
   return std::nullopt;
 }

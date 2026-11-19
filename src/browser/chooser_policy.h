@@ -1,6 +1,7 @@
 #pragma once
 
 #include "browser/directory_model.h"
+#include "fs/cancel_token.h"
 
 #include <cstdint>
 #include <optional>
@@ -23,9 +24,9 @@ namespace luciole {
   chooserDecision(ChooserMode mode, const std::optional<Location>& folder, std::span<const DirectoryEntry> entries);
   // Whether choosing `entry` depends on a link target that chosenType() has to read.
   bool isLink(const DirectoryEntry& entry);
-  // The kind a chooser treats `entry` as: a link counts as its native target's kind, or stays a link when that cannot
-  // be read. Following a link can block on a slow or hung mount.
-  FileType chosenType(const DirectoryEntry& entry);
+  // The kind a chooser treats `entry` as: a link counts as its native target's kind, or stays a link when the target
+  // is missing or loops. Following a link runs through the filesystem helper and must stay off the UI thread.
+  FileType chosenType(const DirectoryEntry& entry, const CancelToken& token = {});
   // Whether selecting an item of the chosen kind while saving offers its name to save over; folders are entered.
   bool offersSaveName(FileType chosen);
   // The selected entries of `model`, in row order.
