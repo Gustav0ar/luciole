@@ -5,6 +5,7 @@
 #include "fs/filename.h"
 #include "fs/gio_interop.h"
 #include "fs/posix_fd.h"
+#include "fs/system_mounts.h"
 #include "operations/history_mount.h"
 
 #include <algorithm>
@@ -777,6 +778,12 @@ bool luciole::BatchRenameService::prepare(std::vector<DirectoryEntry> entries) {
   m_state->snapshot = {};
   m_state->snapshot.phase = BatchRenamePhase::Preparing;
   State::launch(m_state, State::Kind::Prepare, [token = m_state->token, entries = std::move(entries)] mutable {
+    std::vector<Location> guardLocations;
+    guardLocations.reserve(entries.size());
+    for (const auto& entry : entries) {
+      guardLocations.push_back(entry.location());
+    }
+    const auto mounts = openSystemMounts(guardLocations, token, false);
     return State::Reply{
         .prepared = prepareItems(std::move(entries), token), .rows = {}, .results = {}, .report = {}, .receipt = {}
     };
@@ -810,6 +817,7 @@ bool luciole::BatchRenameService::apply() {
   State::launch(
       m_state, State::Kind::Apply,
       [owner = m_state, token = m_state->token, plan = m_state->prepared, approved = m_state->snapshot.rows] {
+        const auto mount = openSystemMount(plan->parent, token);
         std::vector<std::string> names;
         for (const auto& row : *approved) {
           names.push_back(row.name);

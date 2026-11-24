@@ -2,6 +2,7 @@
 
 #include "fs/background_job.h"
 #include "fs/cancel_token.h"
+#include "fs/system_mounts.h"
 #include "operations/permission_jobs.h"
 #include "operations/permission_target.h"
 
@@ -178,6 +179,7 @@ bool luciole::PermissionService::prepare(std::vector<DirectoryEntry> entries) {
         for (std::size_t i = 0; i < entries.size() && !token.cancelled(); ++i) {
           auto& row = (*bulk->results)[i];
           try {
+            const auto mount = openSystemMount(entries[i].location(), token, false);
             auto target = preparePermissionTarget(entries[i], false);
             target->loadAcl(true);
             row.info = target->inspect();
@@ -185,6 +187,9 @@ bool luciole::PermissionService::prepare(std::vector<DirectoryEntry> entries) {
             row.message = row.info->reason;
             bulk->targets[i] = std::move(target);
           } catch (const std::exception&) {
+            if (token.cancelled()) {
+              break;
+            }
             row.outcome = PermissionOutcome::Failed;
             row.error = currentFileError();
             row.message.clear();
@@ -209,6 +214,7 @@ bool luciole::PermissionService::prepareEntry(DirectoryEntry entry, bool capture
   State::launch(
       m_state,
       [entry = std::move(entry), captureCurrentLocation](const CancelToken& token) {
+        const auto mount = openSystemMount(entry.location(), token, false);
         auto target = preparePermissionTarget(entry, captureCurrentLocation);
         if (token.cancelled()) {
           return Reply{};
@@ -245,6 +251,14 @@ bool luciole::PermissionService::apply(PermissionEdit edit) {
     State::launch(
         m_state,
         [owner = m_state, bulk = m_state->bulk, edit = std::move(edit)](const CancelToken& token) {
+          std::vector<Location> guardLocations;
+          guardLocations.reserve(bulk->targets.size());
+          for (std::size_t i = 0; i < bulk->targets.size(); ++i) {
+            if (bulk->targets[i]) {
+              guardLocations.push_back((*bulk->results)[i].location);
+            }
+          }
+          const auto mounts = openSystemMounts(guardLocations, token, false);
           return applyBulkPermissionEdit(bulk, edit, token, owner->completed);
         },
         true
@@ -254,6 +268,7 @@ bool luciole::PermissionService::apply(PermissionEdit edit) {
   State::launch(
       m_state,
       [target = m_state->target, edit = std::move(edit)](const CancelToken& token) {
+        const auto mount = openSystemMount(target->entry.location(), token, false);
         return applyPermissionEdit(target, edit, token);
       },
       true
@@ -292,6 +307,14 @@ bool luciole::PermissionService::applyRecursive(RecursivePermissionEdit edit) {
   State::launch(
       m_state,
       [owner = m_state, roots, edit = std::move(edit)](const CancelToken& token) {
+        std::vector<Location> guardLocations;
+        guardLocations.reserve(roots->targets.size());
+        for (std::size_t i = 0; i < roots->targets.size(); ++i) {
+          if (roots->targets[i]) {
+            guardLocations.push_back((*roots->results)[i].location);
+          }
+        }
+        const auto mounts = openSystemMounts(guardLocations, token, false);
         return applyRecursivePermissionEdit(roots, edit, token, owner->completed, owner->total, owner->collecting);
       },
       true
@@ -308,6 +331,7 @@ bool luciole::PermissionService::applyAcl(AclEdit edit) {
   State::launch(
       m_state,
       [target = m_state->target, edit = std::move(edit)](const CancelToken& token) {
+        const auto mount = openSystemMount(target->entry.location(), token, false);
         return applyAclEdit(target, edit, token);
       },
       true
@@ -329,6 +353,14 @@ bool luciole::PermissionService::applyAclPatch(AclPatchEdit edit) {
   State::launch(
       m_state,
       [owner = m_state, bulk = m_state->bulk, edit = std::move(edit)](const CancelToken& token) {
+        std::vector<Location> guardLocations;
+        guardLocations.reserve(bulk->targets.size());
+        for (std::size_t i = 0; i < bulk->targets.size(); ++i) {
+          if (bulk->targets[i]) {
+            guardLocations.push_back((*bulk->results)[i].location);
+          }
+        }
+        const auto mounts = openSystemMounts(guardLocations, token, false);
         return applyBulkAclPatch(bulk, edit, token, owner->completed);
       },
       true

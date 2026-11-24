@@ -3,6 +3,7 @@
 #include "fs/background_job.h"
 #include "fs/filename.h"
 #include "fs/posix_fd.h"
+#include "fs/system_mounts.h"
 
 #include <cerrno>
 #include <fcntl.h>
@@ -102,11 +103,12 @@ bool luciole::RenameService::prepare(const Location& source) {
   m_state->snapshot = {
       .status = RenameStatus::Preparing, .source = source, .destination = std::nullopt, .error = {}, .receipt = {}
   };
-  State::launch(m_state, [source](const CancelToken&) {
+  State::launch(m_state, [source](const CancelToken& token) {
     const auto path = source.nativePath();
     if (!path) {
       throwFileError(FileErrorKind::Unsupported, "Renaming remote items is not supported yet.");
     }
+    const auto mount = openSystemMount(source, token, false);
     const auto name = std::filesystem::path(*path).filename().native();
     if (name.empty() || name == "." || name == "..") {
       throwFileError(FileErrorKind::InvalidArgument, "The filesystem root cannot be renamed.");
@@ -128,6 +130,7 @@ bool luciole::RenameService::rename(std::string name) {
   m_state->snapshot.status = RenameStatus::Renaming;
   m_state->snapshot.error.reset();
   State::launch(m_state, [target = m_state->target, name = std::move(name)](const CancelToken& token) {
+    const auto mount = openSystemMount(Location::fromPath(target->parentPath), token);
     auto destination = Location::fromPath((std::filesystem::path(target->parentPath) / name).native());
     const auto parent = checkedFd(::open(target->parentPath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (!sameIdentity(statFd(parent.get()), statFd(target->parent.get()))) {
