@@ -40,17 +40,33 @@ namespace {
       "," G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME "," G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH
       "," G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE "," G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE
       "," G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE "," G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM;
-  std::string browseAttributes(std::uint8_t details) {
+  // Mounted network shares omit per-child access(R/W/X) and content sniffing: on NFS/SMB those send synchronous
+  // ACCESS and OPEN/READ RPCs per entry instead of letting READDIRPLUS satisfy enumeration.
+  constexpr const char* kNetworkAttributes = G_FILE_ATTRIBUTE_STANDARD_NAME
+      "," G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE
+      "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN "," G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK
+      "," G_FILE_ATTRIBUTE_STANDARD_SIZE "," G_FILE_ATTRIBUTE_TIME_MODIFIED "," G_FILE_ATTRIBUTE_TIME_ACCESS
+      "," G_FILE_ATTRIBUTE_TIME_CREATED "," G_FILE_ATTRIBUTE_OWNER_USER "," G_FILE_ATTRIBUTE_OWNER_GROUP
+      "," G_FILE_ATTRIBUTE_UNIX_MODE "," G_FILE_ATTRIBUTE_TIME_CHANGED
+      ",time::changed-nsec," G_FILE_ATTRIBUTE_TIME_CHANGED_USEC "," G_FILE_ATTRIBUTE_ETAG_VALUE
+      "," G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME "," G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH
+      "," G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE "," G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE
+      "," G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM;
+  std::string browseAttributes(std::uint8_t details, bool network = false) {
     std::string attributes = G_FILE_ATTRIBUTE_STANDARD_NAME
         "," G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE
         "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN "," G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK
         "," G_FILE_ATTRIBUTE_STANDARD_SIZE "," G_FILE_ATTRIBUTE_TIME_MODIFIED "," G_FILE_ATTRIBUTE_TIME_CHANGED
         ",time::changed-nsec," G_FILE_ATTRIBUTE_TIME_CHANGED_USEC "," G_FILE_ATTRIBUTE_ETAG_VALUE
-        "," G_FILE_ATTRIBUTE_ACCESS_CAN_READ "," G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE
-        "," G_FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE "," G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME
-        "," G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH "," G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE
-        "," G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE "," G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE
+        "," G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME "," G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH
+        "," G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE "," G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE
         "," G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM;
+    if (!network) {
+      attributes.append(
+          "," G_FILE_ATTRIBUTE_ACCESS_CAN_READ "," G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE
+          "," G_FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE "," G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE
+      );
+    }
     for (const auto& [flag, attribute] :
          {std::pair{luciole::EntryDetails::Accessed, G_FILE_ATTRIBUTE_TIME_ACCESS},
           std::pair{luciole::EntryDetails::Created, G_FILE_ATTRIBUTE_TIME_CREATED},
@@ -258,9 +274,10 @@ namespace luciole {
         }
       }
     }
+    entry.contentType = readContentType(info);
     entry.icon = local
         ? icons.getLocal(
-              name, g_file_info_get_file_type(info), infoString(info, G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE), *folder
+              name, g_file_info_get_file_type(info), entry.contentType ? entry.contentType->c_str() : nullptr, *folder
           )
         : icons.get(info, *folder);
     if (trashFolder) {
@@ -270,7 +287,6 @@ namespace luciole {
     }
     entry.details = readEntryMetadata(info);
     entry.setIdentity(readFileIdentity(info));
-    entry.contentType = readContentType(info);
     if (const auto size = infoUint64(info, G_FILE_ATTRIBUTE_STANDARD_SIZE); size && *size <= G_MAXINT64) {
       entry.size = size;
     }
@@ -323,6 +339,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
     // is dropped then.
     std::unordered_map<std::string, std::uint64_t> identities;
     bool local = false;
+    bool network = false;
     bool trash = false;
     DirectoryMetadata metadata;
     std::optional<FileError> accessError;
@@ -417,6 +434,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
     struct Job {
       DirectoryEntries entries;
       std::shared_ptr<const Location> folder;
+      bool network = false;
       std::vector<std::pair<std::size_t, std::uint8_t>> requests;
       std::vector<std::pair<std::size_t, DirectoryEntry>> facts;
       CatalogueValidation validation;
@@ -424,6 +442,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
     auto job = std::make_unique<Job>();
     job->entries = snapshot.entries;
     job->folder = scan->folder;
+    job->network = scan->network;
     while (!factsRequested.empty() && job->requests.size() < 128) {
       const auto found = factsRequested.begin();
       auto [index, details] = *found;
@@ -509,7 +528,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
         }
         const auto brief = job.entries.brief(index);
         const auto file = gioFile(job.folder->child(std::string(brief.name)));
-        const auto attributes = browseAttributes(details);
+        const auto attributes = browseAttributes(details, job.network);
         const GioPtr<GFileInfo> info(
             g_file_query_info(file.get(), attributes.c_str(), G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, nullptr)
         );
@@ -892,6 +911,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
   }
 
   void listed(NativeListing listing) {
+    scan->network = listing.network;
     if (listing.unsupported) {
       enumerate();
       return;
@@ -919,7 +939,9 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
     }
     scan->entries = std::move(listing.entries);
     collectLinks();
-    collectIconCandidates();
+    if (!scan->network) {
+      collectIconCandidates();
+    }
     const auto listedScan = scan;
     if (listing.limited) {
       complete(FileError{FileErrorKind::Unsupported, std::string(kEntryLimitMessage)});
@@ -1406,7 +1428,7 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
   }
 
   void enumerate() {
-    std::string attributes = kAttributes;
+    std::string attributes = scan->local && scan->network ? kNetworkAttributes : kAttributes;
     if (!scan->local) {
       attributes.append(",").append(kIconAttribute).append(",").append(G_FILE_ATTRIBUTE_STANDARD_TARGET_URI);
     }
