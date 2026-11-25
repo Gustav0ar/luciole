@@ -36,23 +36,15 @@ namespace {
       "," G_FILE_ATTRIBUTE_TIME_CREATED "," G_FILE_ATTRIBUTE_OWNER_USER "," G_FILE_ATTRIBUTE_OWNER_GROUP
       "," G_FILE_ATTRIBUTE_UNIX_MODE "," G_FILE_ATTRIBUTE_TIME_CHANGED
       ",time::changed-nsec," G_FILE_ATTRIBUTE_TIME_CHANGED_USEC "," G_FILE_ATTRIBUTE_ETAG_VALUE
-      "," G_FILE_ATTRIBUTE_ACCESS_CAN_READ "," G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE "," G_FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE
-      "," G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME "," G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH
-      "," G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE "," G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE
-      "," G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE "," G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM;
-  // Mounted network shares omit per-child access(R/W/X) and content sniffing: on NFS/SMB those send synchronous
-  // ACCESS and OPEN/READ RPCs per entry instead of letting READDIRPLUS satisfy enumeration.
-  constexpr const char* kNetworkAttributes = G_FILE_ATTRIBUTE_STANDARD_NAME
-      "," G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE
-      "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN "," G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK
-      "," G_FILE_ATTRIBUTE_STANDARD_SIZE "," G_FILE_ATTRIBUTE_TIME_MODIFIED "," G_FILE_ATTRIBUTE_TIME_ACCESS
-      "," G_FILE_ATTRIBUTE_TIME_CREATED "," G_FILE_ATTRIBUTE_OWNER_USER "," G_FILE_ATTRIBUTE_OWNER_GROUP
-      "," G_FILE_ATTRIBUTE_UNIX_MODE "," G_FILE_ATTRIBUTE_TIME_CHANGED
-      ",time::changed-nsec," G_FILE_ATTRIBUTE_TIME_CHANGED_USEC "," G_FILE_ATTRIBUTE_ETAG_VALUE
       "," G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME "," G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH
       "," G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE "," G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE
       "," G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM;
-  std::string browseAttributes(std::uint8_t details, bool network = false) {
+  // Mounted network shares omit per-child access(R/W/X) and content sniffing: on NFS/SMB those send synchronous
+  // ACCESS and OPEN/READ RPCs per entry instead of letting READDIRPLUS satisfy enumeration.
+  constexpr const char* kProbeAttributes =
+      "," G_FILE_ATTRIBUTE_ACCESS_CAN_READ "," G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE "," G_FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE
+      "," G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE;
+  std::string browseAttributes(std::uint8_t details, bool network) {
     std::string attributes = G_FILE_ATTRIBUTE_STANDARD_NAME
         "," G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE
         "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN "," G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK
@@ -65,10 +57,7 @@ namespace {
       // Without access::can-execute, the context menu's Run entry falls back to the mode's execute bits.
       details |= luciole::EntryDetails::Permissions;
     } else {
-      attributes.append(
-          "," G_FILE_ATTRIBUTE_ACCESS_CAN_READ "," G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE
-          "," G_FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE "," G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE
-      );
+      attributes.append(kProbeAttributes);
     }
     for (const auto& [flag, attribute] :
          {std::pair{luciole::EntryDetails::Accessed, G_FILE_ATTRIBUTE_TIME_ACCESS},
@@ -1431,7 +1420,10 @@ struct luciole::DirectorySession::State : std::enable_shared_from_this<State> {
   }
 
   void enumerate() {
-    std::string attributes = scan->local && scan->network ? kNetworkAttributes : kAttributes;
+    std::string attributes = kAttributes;
+    if (!scan->network) {
+      attributes.append(kProbeAttributes);
+    }
     if (!scan->local) {
       attributes.append(",").append(kIconAttribute).append(",").append(G_FILE_ATTRIBUTE_STANDARD_TARGET_URI);
     }
