@@ -448,9 +448,6 @@ void FileChooserSession::open(const std::vector<luciole::DirectoryEntry>& target
     m_openAfterTypes.emplace(targets, m_page->browser().model().selectedIds(), false);
     return;
   }
-  if (std::ranges::any_of(entries, &luciole::DirectoryEntry::metadataPending)) {
-    return;
-  }
   if (m_typeSources.empty()) {
     finishOpen(targets, entries);
   } else {
