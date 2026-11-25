@@ -116,27 +116,32 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
     handles.clear();
     addRoot();
     std::map<std::string, Handle> systemHandles;
+    // A mount at a configured system mount path belongs to its system row, keyed by the target URI.
+    const auto systemMountUri = [&](GMount* mount) -> std::optional<std::string> {
+      const GioPtr<GFile> root(g_mount_get_root(mount));
+      const auto location = locationFromFile(root.get());
+      const bool owned = std::ranges::any_of(systemMounts.mounts(), [&](const SystemMount& candidate) {
+        return Location::fromPath(candidate.configuration.path) == location;
+      });
+      return owned ? std::optional(location.uri()) : std::nullopt;
+    };
     GList* volumes = g_volume_monitor_get_volumes(monitor.get());
     for (GList* item = volumes; item != nullptr; item = item->next) {
       GioPtr<GVolume> volume(G_VOLUME(item->data));
+      GioPtr<GMount> mount(g_volume_get_mount(volume.get()));
+      if (mount) {
+        if (auto uri = systemMountUri(mount.get())) {
+          systemHandles.emplace(
+              std::move(*uri), Handle{.volume = std::move(volume), .mount = std::move(mount), .device = nullptr}
+          );
+        } else {
+          add({.volume = std::move(volume), .mount = std::move(mount), .device = nullptr});
+        }
+        continue;
+      }
       const GString kind(g_volume_get_identifier(volume.get(), G_VOLUME_IDENTIFIER_KIND_CLASS));
       const GString device(g_volume_get_identifier(volume.get(), G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE));
       const GioPtr<GFile> activation(g_volume_get_activation_root(volume.get()));
-      GioPtr<GMount> mount(g_volume_get_mount(volume.get()));
-      if (mount) {
-        const GioPtr<GFile> root(g_mount_get_root(mount.get()));
-        const auto location = locationFromFile(root.get());
-        if (std::ranges::any_of(systemMounts.mounts(), [&](const auto& candidate) {
-              return Location::fromPath(candidate.configuration.path) == location;
-            })) {
-          systemHandles.emplace(
-              location.uri(), Handle{.volume = std::move(volume), .mount = std::move(mount), .device = nullptr}
-          );
-          continue;
-        }
-        add({.volume = std::move(volume), .mount = std::move(mount), .device = nullptr});
-        continue;
-      }
       // Unmounted GVfs fstab network volumes expose no path or device identifier, only their display label.
       const bool matchesSource = device && std::ranges::any_of(systemMounts.mounts(), [&](const auto& candidate) {
                                    return sameMountSource(candidate.configuration.source, device.get());
@@ -160,13 +165,9 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
       GioPtr<GMount> mount(G_MOUNT(item->data));
       const GioPtr<GVolume> volume(g_mount_get_volume(mount.get()));
       if (!volume && g_mount_is_shadowed(mount.get()) == FALSE) {
-        const GioPtr<GFile> root(g_mount_get_root(mount.get()));
-        const auto location = locationFromFile(root.get());
-        if (std::ranges::any_of(systemMounts.mounts(), [&](const auto& candidate) {
-              return Location::fromPath(candidate.configuration.path) == location;
-            })) {
+        if (auto uri = systemMountUri(mount.get())) {
           systemHandles.emplace(
-              location.uri(), Handle{.volume = nullptr, .mount = std::move(mount), .device = nullptr}
+              std::move(*uri), Handle{.volume = nullptr, .mount = std::move(mount), .device = nullptr}
           );
           continue;
         }
