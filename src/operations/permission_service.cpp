@@ -52,6 +52,16 @@ namespace {
       snapshot.info->reason += std::format(" {} items cannot be edited; see Results for details.", unavailable);
     }
   }
+  // Holds the automounts of the prepared targets for the job's duration.
+  std::vector<Fd> openBatchMounts(const PermissionBatch& batch, const CancelToken& token) {
+    std::vector<Location> locations;
+    for (std::size_t i = 0; i < batch.targets.size(); ++i) {
+      if (batch.targets[i]) {
+        locations.push_back((*batch.results)[i].location);
+      }
+    }
+    return openSystemMounts(locations, token, false);
+  }
 } // namespace
 
 struct luciole::PermissionService::State {
@@ -251,14 +261,7 @@ bool luciole::PermissionService::apply(PermissionEdit edit) {
     State::launch(
         m_state,
         [owner = m_state, bulk = m_state->bulk, edit = std::move(edit)](const CancelToken& token) {
-          std::vector<Location> guardLocations;
-          guardLocations.reserve(bulk->targets.size());
-          for (std::size_t i = 0; i < bulk->targets.size(); ++i) {
-            if (bulk->targets[i]) {
-              guardLocations.push_back((*bulk->results)[i].location);
-            }
-          }
-          const auto mounts = openSystemMounts(guardLocations, token, false);
+          const auto mounts = openBatchMounts(*bulk, token);
           return applyBulkPermissionEdit(bulk, edit, token, owner->completed);
         },
         true
@@ -307,14 +310,7 @@ bool luciole::PermissionService::applyRecursive(RecursivePermissionEdit edit) {
   State::launch(
       m_state,
       [owner = m_state, roots, edit = std::move(edit)](const CancelToken& token) {
-        std::vector<Location> guardLocations;
-        guardLocations.reserve(roots->targets.size());
-        for (std::size_t i = 0; i < roots->targets.size(); ++i) {
-          if (roots->targets[i]) {
-            guardLocations.push_back((*roots->results)[i].location);
-          }
-        }
-        const auto mounts = openSystemMounts(guardLocations, token, false);
+        const auto mounts = openBatchMounts(*roots, token);
         return applyRecursivePermissionEdit(roots, edit, token, owner->completed, owner->total, owner->collecting);
       },
       true
@@ -353,14 +349,7 @@ bool luciole::PermissionService::applyAclPatch(AclPatchEdit edit) {
   State::launch(
       m_state,
       [owner = m_state, bulk = m_state->bulk, edit = std::move(edit)](const CancelToken& token) {
-        std::vector<Location> guardLocations;
-        guardLocations.reserve(bulk->targets.size());
-        for (std::size_t i = 0; i < bulk->targets.size(); ++i) {
-          if (bulk->targets[i]) {
-            guardLocations.push_back((*bulk->results)[i].location);
-          }
-        }
-        const auto mounts = openSystemMounts(guardLocations, token, false);
+        const auto mounts = openBatchMounts(*bulk, token);
         return applyBulkAclPatch(bulk, edit, token, owner->completed);
       },
       true

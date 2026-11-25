@@ -7,6 +7,7 @@
 #include "operations/trash_item.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <fcntl.h>
 #include <filesystem>
@@ -23,22 +24,22 @@ namespace {
     std::optional<std::uint64_t> bytes = 0;
     bool incomplete = false;
   };
+  std::vector<luciole::Fd> openTargetMounts(const Targets& targets, const luciole::CancelToken& token) {
+    std::vector<luciole::Location> locations;
+    locations.reserve(targets.size());
+    for (const auto& target : targets) {
+      locations.push_back(target.location);
+    }
+    return luciole::openSystemMounts(locations, token, false);
+  }
   Size measureSize(const Targets& targets, const luciole::CancelToken& token, bool outsideTrash) {
     struct Folder {
       luciole::Location location;
       unsigned int depth;
     };
-    std::vector<luciole::Fd> mounts;
-    std::vector<luciole::MountConfiguration> configured;
-    if (outsideTrash) {
-      std::vector<luciole::Location> guardLocations;
-      guardLocations.reserve(targets.size());
-      for (const auto& target : targets) {
-        guardLocations.push_back(target.location);
-      }
-      mounts = luciole::openSystemMounts(guardLocations, token, false);
-      configured = luciole::configuredSystemMounts();
-    }
+    const auto mounts = outsideTrash ? openTargetMounts(targets, token) : std::vector<luciole::Fd>{};
+    const auto configured =
+        outsideTrash ? luciole::configuredSystemMounts() : std::vector<luciole::MountConfiguration>{};
     Size reply;
     std::vector<Folder> pending;
     constexpr const char* attributes = "standard::name,standard::type,standard::is-symlink,standard::size";
@@ -142,23 +143,16 @@ namespace {
       return Outcome::Unconfirmed;
     }
   }
-  std::optional<std::string> descriptorPath(int fd) {
-    const auto link = "/proc/self/fd/" + std::to_string(fd);
-    std::string buffer(256, '\0');
-    for (;;) {
-      const ssize_t length = ::readlink(link.c_str(), buffer.data(), buffer.size());
-      if (length < 0) {
-        return std::nullopt;
-      }
-      if (static_cast<std::size_t>(length) < buffer.size()) {
-        buffer.resize(static_cast<std::size_t>(length));
-        return buffer;
-      }
-      if (buffer.size() >= 65536) {
-        return std::nullopt;
-      }
-      buffer.resize(buffer.size() * 2);
+  // Pinned parent path, so the automount check sees the directory actually being deleted.
+  std::string descriptorPath(int fd) {
+    std::array<char, 8192> buffer{};
+    const auto count = ::readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), buffer.data(), buffer.size());
+    if (count <= 0 || static_cast<std::size_t>(count) == buffer.size()) {
+      luciole::throwFileError(
+          luciole::FileErrorKind::NotMounted, "Could not verify automount boundaries for the folder being deleted."
+      );
     }
+    return {buffer.data(), static_cast<std::size_t>(count)};
   }
   // Deletes name inside parent through descriptors, so a path swapped in by another process is never followed.
   void removeTree(int parent, const std::string& name) {
@@ -387,17 +381,8 @@ void luciole::EmptyTrashService::State::startEmpty(const std::shared_ptr<State>&
   launch<std::vector<EmptyTrashResult>>(
       owner,
       [owner, token = owner->token, targets = owner->targets, outsideTrash = owner->snapshot.outsideTrash] {
-        std::vector<Fd> mounts;
-        std::vector<MountConfiguration> configured;
-        if (outsideTrash) {
-          std::vector<Location> guardLocations;
-          guardLocations.reserve(targets->size());
-          for (const auto& target : *targets) {
-            guardLocations.push_back(target.location);
-          }
-          mounts = openSystemMounts(guardLocations, token, false);
-          configured = configuredSystemMounts();
-        }
+        const auto mounts = outsideTrash ? openTargetMounts(*targets, token) : std::vector<Fd>{};
+        const auto configured = outsideTrash ? configuredSystemMounts() : std::vector<MountConfiguration>{};
         auto results = pendingResults(*targets);
         for (std::size_t index = 0; index < targets->size(); ++index) {
           if (token.cancelled()) {
@@ -429,29 +414,16 @@ void luciole::EmptyTrashService::State::startEmpty(const std::shared_ptr<State>&
               }
               if (outsideTrash) {
                 if (S_ISDIR(pinned.st_mode) && std::ranges::any_of(configured, &MountConfiguration::automount)) {
-                  const auto pinnedParent = descriptorPath(parent.get());
-                  if (!pinnedParent) {
-                    result.outcome = EmptyTrashOutcome::Failed;
-                    result.error = FileError{
-                        .kind = FileErrorKind::NotMounted,
-                        .message = "Could not verify automount boundaries for the folder being deleted."
-                    };
-                    owner->completed.fetch_add(1);
-                    continue;
-                  }
                   const auto pinnedLocation =
-                      Location::fromPath((std::filesystem::path(*pinnedParent) / name).native());
+                      Location::fromPath((std::filesystem::path(descriptorPath(parent.get())) / name).native());
                   if (const auto childMount = automountInside(pinnedLocation, configured)) {
-                    result.outcome = EmptyTrashOutcome::Failed;
-                    result.error = FileError{
-                        .kind = FileErrorKind::NotMounted,
-                        .message = std::format(
+                    throwFileError(
+                        FileErrorKind::NotMounted,
+                        std::format(
                             "Cannot permanently delete a folder containing the configured automount at {}.",
                             childMount->path
                         )
-                    };
-                    owner->completed.fetch_add(1);
-                    continue;
+                    );
                   }
                 }
                 try {

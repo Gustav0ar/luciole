@@ -890,7 +890,7 @@ namespace {
     }
   }
 
-  std::vector<luciole::TransferResult> failedGuardResults(Job& job, bool retry, const luciole::FileError& failure) {
+  std::vector<luciole::TransferResult> failedResults(Job& job, bool retry, const luciole::FileError& failure) {
     const bool cancelled = failure.kind == luciole::FileErrorKind::Cancelled;
     const auto outcome = cancelled ? luciole::TransferOutcome::Cancelled : luciole::TransferOutcome::Failed;
     const auto error = cancelled ? cancelledError() : failure;
@@ -1124,7 +1124,7 @@ bool luciole::TransferService::launch(TransferRequest request, bool retry) {
           owner->receipt = std::move(result->receipt);
           owner->copyReceipt = std::move(result->copyReceipt);
         } else {
-          owner->results = failedGuardResults(*job, retry, result.error());
+          owner->results = failedResults(*job, retry, result.error());
           owner->report = jobReport(owner->results);
         }
         owner->job = job;
