@@ -61,7 +61,10 @@ namespace {
         "," G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME "," G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH
         "," G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE "," G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE
         "," G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_ID_FILESYSTEM;
-    if (!network) {
+    if (network) {
+      // Without access::can-execute, the context menu's Run entry falls back to the mode's execute bits.
+      details |= luciole::EntryDetails::Permissions;
+    } else {
       attributes.append(
           "," G_FILE_ATTRIBUTE_ACCESS_CAN_READ "," G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE
           "," G_FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE "," G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE
