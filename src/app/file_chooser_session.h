@@ -111,7 +111,7 @@ private:
   std::optional<luciole::EntryId> m_namedFrom;
   luciole::CancelToken m_nameLookup;
   std::optional<luciole::Location> m_folder;
-  // Destinations the user was asked about; saving to exactly these again replaces them.
+  // Existing destinations the user was asked about; saving while exactly these exist replaces them.
   std::vector<luciole::Location> m_confirm;
   std::string m_reasonText;
   std::shared_ptr<int> m_lifetime = std::make_shared<int>(0);

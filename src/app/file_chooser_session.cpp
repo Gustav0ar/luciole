@@ -25,8 +25,8 @@
 namespace {
   const Logger kLog("file-chooser");
 
-  // Listings report links as links, without their target's kind; the chooser policy resolves the selected ones, so
-  // every filter keeps links (and entries of unread kind) rather than hiding a linked folder or file.
+  // Listings report links as links, without their target's kind; the session resolves the selected ones on a worker,
+  // so every filter keeps links (and entries of unread kind) rather than hiding a linked folder or file.
   bool unresolved(const luciole::EntryBrief& brief) {
     return brief.symlink || brief.type == luciole::FileType::Symlink || brief.type == luciole::FileType::Unknown;
   }
