@@ -173,17 +173,6 @@ namespace luciole::transfer {
     return {};
   }
 
-  std::optional<BlockMount> blockMount(std::string_view mountinfo, std::uint64_t mountId, bool* found) {
-    const auto entry = mountInfo(mountinfo, mountId);
-    if (found) {
-      *found = entry.has_value();
-    }
-    if (!entry || !entry->source.starts_with("/dev/")) {
-      return {};
-    }
-    return BlockMount{entry->filesystem, entry->source};
-  }
-
   std::size_t mountPaceLimit(std::string_view type) {
     if (type == "cifs" || type == "smb3") {
       return kSmbPaceLimit;

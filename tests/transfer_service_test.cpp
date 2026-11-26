@@ -452,15 +452,12 @@ namespace {
                                         "43 1 0:70 / /media/t rw - fuseblk /dev/mapper/portable\\040disk rw\n"
                                         "44 1 0:71 / /mnt/n rw - nfs4 server:/export rw\n"
                                         "45 1 0:72 / /mnt/s rw - smb3 //server/share rw\n";
-    bool found = false;
-    const auto usb = luciole::transfer::blockMount(mounts, 41, &found);
-    TEST_CHECK(found);
-    const auto subvolume = luciole::transfer::blockMount(mounts, 42, &found);
-    TEST_CHECK(found && usb && subvolume && usb->source == "/dev/sdb1" && usb->filesystem == subvolume->filesystem);
-    TEST_CHECK(luciole::transfer::blockMount(mounts, 43)->source == "/dev/mapper/portable disk");
-    TEST_CHECK(!luciole::transfer::blockMount(mounts, 44, &found) && found);
-    TEST_CHECK(!luciole::transfer::blockMount(mounts, 45, &found) && found);
-    TEST_CHECK(!luciole::transfer::blockMount(mounts, 999, &found) && !found);
+    const auto usb = luciole::transfer::mountInfo(mounts, 41);
+    const auto subvolume = luciole::transfer::mountInfo(mounts, 42);
+    TEST_CHECK(usb && subvolume && usb->type == "btrfs" && usb->source == "/dev/sdb1");
+    TEST_CHECK(usb && subvolume && usb->filesystem == subvolume->filesystem);
+    TEST_CHECK(luciole::transfer::mountInfo(mounts, 43)->source == "/dev/mapper/portable disk");
+    TEST_CHECK(!luciole::transfer::mountInfo(mounts, 999));
     const auto nfsEntry = luciole::transfer::mountInfo(mounts, 44);
     const auto smbEntry = luciole::transfer::mountInfo(mounts, 45);
     TEST_CHECK(nfsEntry && nfsEntry->type == "nfs4" && nfsEntry->source == "server:/export");

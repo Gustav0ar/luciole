@@ -24,14 +24,8 @@ namespace luciole::transfer {
     std::string type;
     std::string source;
   };
-  struct BlockMount {
-    dev_t filesystem;
-    std::string source;
-  };
   // Resolves mountId from a mountinfo snapshot, regardless of filesystem type.
   std::optional<MountInfo> mountInfo(std::string_view mountinfo, std::uint64_t mountId);
-  // Resolves mountId from mountinfo; sets *found when the mount entry exists even if not block-backed.
-  std::optional<BlockMount> blockMount(std::string_view mountinfo, std::uint64_t mountId, bool* found = nullptr);
   // Returns the adaptive writeback pacing cap for a mounted filesystem type, or 0 for unpaced local disks.
   std::size_t mountPaceLimit(std::string_view type);
 
