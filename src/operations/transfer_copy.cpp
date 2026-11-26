@@ -1,7 +1,9 @@
 #include "operations/transfer_copy.h"
 
 #include "operations/history_revisions.h"
+#include "operations/transfer_pacing.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <dirent.h>
@@ -86,12 +88,23 @@ namespace luciole::transfer {
           || error == EPERM;
     }
 
+    ssize_t copyRangeChunk(int input, int output, std::size_t length, const CopyWork& work) {
+      return work.writebackOps && work.writebackOps->copyRange
+          ? work.writebackOps->copyRange(input, output, length)
+          : ::copy_file_range(input, nullptr, output, nullptr, length, 0);
+    }
+
+    ssize_t writeOutputChunk(int output, const char* data, std::size_t length, const CopyWork& work) {
+      return work.writebackOps && work.writebackOps->writeChunk ? work.writebackOps->writeChunk(output, data, length)
+                                                                : ::write(output, data, length);
+    }
+
     // Copies the contents of `input` into the empty `output`: a copy-on-write clone (btrfs, XFS, bcachefs), then an
     // in-kernel copy, then a userspace loop. Each step resumes where the previous one stopped.
-    void copyData(int input, int output, CopyWork& work) {
-      if (!work.cloneUnsupported) {
-        if (::ioctl(output, FICLONE, input) == 0) {
-          work.bytes.fetch_add(static_cast<std::uint64_t>(statFd(output).st_size));
+    void copyData(int input, Fd& output, CopyWork& work) {
+      if (!work.cloneUnsupported && (!work.writebackOps || work.writebackOps->allowClone)) {
+        if (::ioctl(output.get(), FICLONE, input) == 0) {
+          work.bytes.fetch_add(static_cast<std::uint64_t>(statFd(output.get()).st_size));
           return;
         }
         if (!unsupported(errno)) {
@@ -101,14 +114,31 @@ namespace luciole::transfer {
       }
       // Chunks keep progress and cancellation responsive on large files.
       constexpr std::size_t kChunk = 8 * 1024 * 1024;
+      std::optional<PacedWriter> pacer;
+      if (work.paceLimit > 0) {
+        pacer.emplace(output, work);
+      }
+      const auto record = [&](std::uint64_t count) {
+        if (pacer) {
+          pacer->wrote(count);
+        } else {
+          work.bytes.fetch_add(count);
+        }
+      };
+      const auto limit = [&](std::size_t maxChunk) {
+        return pacer ? std::min(maxChunk, pacer->remaining()) : maxChunk;
+      };
       while (!work.rangeUnsupported) {
         work.check();
-        const auto copied = ::copy_file_range(input, nullptr, output, nullptr, kChunk, 0);
+        const auto copied = copyRangeChunk(input, output.get(), limit(kChunk), work);
         if (copied > 0) {
-          work.bytes.fetch_add(static_cast<std::uint64_t>(copied));
+          record(static_cast<std::uint64_t>(copied));
           continue;
         }
         if (copied == 0) {
+          if (pacer) {
+            pacer->finish();
+          }
           return;
         }
         if (errno == EINTR) {
@@ -123,7 +153,7 @@ namespace luciole::transfer {
       auto& buffer = work.buffer;
       for (;;) {
         work.check();
-        const auto size = ::read(input, buffer.data(), buffer.size());
+        const auto size = ::read(input, buffer.data(), limit(buffer.size()));
         if (size < 0) {
           if (errno == EINTR) {
             continue;
@@ -131,12 +161,17 @@ namespace luciole::transfer {
           fail("Could not read source");
         }
         if (size == 0) {
+          if (pacer) {
+            pacer->finish();
+          }
           return;
         }
         std::size_t offset = 0;
         while (offset < static_cast<std::size_t>(size)) {
           work.check();
-          const auto written = ::write(output, buffer.data() + offset, static_cast<std::size_t>(size) - offset);
+          const auto written = writeOutputChunk(
+              output.get(), buffer.data() + offset, limit(static_cast<std::size_t>(size) - offset), work
+          );
           if (written < 0) {
             if (errno == EINTR) {
               continue;
@@ -147,7 +182,7 @@ namespace luciole::transfer {
             throwFileError(FileErrorKind::Other, "The destination stopped accepting data.");
           }
           offset += static_cast<std::size_t>(written);
-          work.bytes.fetch_add(static_cast<std::uint64_t>(written));
+          record(static_cast<std::uint64_t>(written));
         }
       }
     }
@@ -307,10 +342,10 @@ namespace luciole::transfer {
       auto input = opened(::openat(from, name.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
       requireUnchanged(source, statFd(input.get()));
       auto output = opened(::openat(to, target.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
-      copyData(input.get(), output.get(), work);
+      copyData(input.get(), output, work);
       requireUnchanged(source, statFd(input.get()));
       preserveMetadata(input.get(), output.get(), source, work);
-      if (output.close() != 0) {
+      if (closeOutput(output, work.writebackOps) != 0) {
         fail("Could not close copied file");
       }
     } else if (S_ISDIR(source.st_mode)) {
@@ -399,8 +434,10 @@ namespace luciole::transfer {
     const bool folder = S_ISDIR(value.st_mode);
     if (folder) {
       auto fd = directory(parent, name);
-      if (::fchmod(fd.get(), 0700) != 0) {
-        fail("Could not clean temporary folder");
+      if ((value.st_mode & 0700) != 0700 && ::fchmod(fd.get(), 0700) != 0) {
+        if (errno != EPERM && errno != EOPNOTSUPP && errno != ENOTSUP) {
+          fail("Could not clean temporary folder");
+        }
       }
       for (const auto& child : children(fd.get())) {
         removeTemporary(fd.get(), child, work);

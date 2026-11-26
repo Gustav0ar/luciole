@@ -12,6 +12,7 @@
 #include "operations/transfer_service.h"
 #include "operations/trash_service.h"
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -21,6 +22,8 @@
 #include <ranges>
 #include <string_view>
 #include <variant>
+
+struct _GSource;
 
 // In variant order of OperationJob::Service.
 enum class JobKind : std::uint8_t {
@@ -159,7 +162,7 @@ public:
   // starts prepared moves to Trash, then drops finished jobs.
   void update(std::optional<luciole::WindowId> preferred);
   // Cancels every job, including prepared moves to Trash; the application exits once they stop.
-  void shutdown();
+  void shutdown(std::chrono::milliseconds cleanupTimeout = std::chrono::seconds(5));
   // Ask every pane to leave a drive before explicit removal.
   void leaveDrive(const luciole::Location& root);
   // Inspect proofs on a worker and retire only history holding this mount. Retained-data cleanup can follow.
@@ -167,6 +170,8 @@ public:
   bool removalReady(const luciole::Location& root) const;
   // True while any job runs.
   bool busy() const;
+  // True while shutdown still waits for jobs or bounded detached transfer cleanup.
+  bool shutdownPending() const;
   bool historyReplayBusy() const;
   bool canUndo() const;
   bool canRedo() const;
@@ -202,6 +207,8 @@ private:
   std::deque<luciole::JobActivity> m_finishedActivities;
   std::size_t m_historyProbes = 0;
   std::size_t m_historyRetirements = 0;
+  _GSource* m_shutdownTimer = nullptr;
+  bool m_shutdownTimedOut = false;
   std::shared_ptr<int> m_lifetime = std::make_shared<int>(0);
 };
 

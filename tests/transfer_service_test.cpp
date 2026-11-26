@@ -5,20 +5,24 @@
 #include "operations/creation_stage.h"
 #include "operations/history_revisions.h"
 #include "operations/move_receipt.h"
+#include "operations/transfer_pacing.h"
 #include "operations/transfer_service.h"
 #include "operations/transfer_staging.h"
 #include "test_check.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <linux/fs.h>
 #include <linux/mman.h>
+#include <mutex>
 #include <print>
 #include <sched.h>
+#include <semaphore>
 #include <stdexcept>
 #include <sys/mount.h>
 #include <sys/resource.h>
@@ -45,7 +49,7 @@ namespace {
   void drainHistoryCleanup() {
     GlibPollSource source;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (luciole::CopyReceipt::cleanupPending()) {
+    while (luciole::CopyReceipt::cleanupPending() || luciole::transfer::cleanupPending()) {
       TEST_CHECK(std::chrono::steady_clock::now() < deadline);
       std::vector<pollfd> fds;
       const auto first = source.addPollFds(fds);
@@ -457,6 +461,22 @@ namespace {
     TEST_CHECK(!luciole::transfer::blockMount(mounts, 44, &found) && found);
     TEST_CHECK(!luciole::transfer::blockMount(mounts, 45, &found) && found);
     TEST_CHECK(!luciole::transfer::blockMount(mounts, 999, &found) && !found);
+    const auto nfsEntry = luciole::transfer::mountInfo(mounts, 44);
+    const auto smbEntry = luciole::transfer::mountInfo(mounts, 45);
+    TEST_CHECK(nfsEntry && nfsEntry->type == "nfs4" && nfsEntry->source == "server:/export");
+    TEST_CHECK(smbEntry && smbEntry->type == "smb3" && smbEntry->source == "//server/share");
+
+    using luciole::transfer::kDefaultPaceLimit;
+    using luciole::transfer::kSmbPaceLimit;
+    using luciole::transfer::mountPaceLimit;
+    TEST_CHECK(mountPaceLimit("nfs") == kDefaultPaceLimit && mountPaceLimit("nfs4") == kDefaultPaceLimit);
+    TEST_CHECK(mountPaceLimit("smbfs") == kDefaultPaceLimit && mountPaceLimit("ncpfs") == kDefaultPaceLimit);
+    TEST_CHECK(mountPaceLimit("cifs") == kSmbPaceLimit && mountPaceLimit("smb3") == kSmbPaceLimit);
+    TEST_CHECK(mountPaceLimit("fuse.sshfs") == kDefaultPaceLimit && mountPaceLimit("fuse.rclone") == kDefaultPaceLimit);
+    TEST_CHECK(mountPaceLimit("fuse.gvfsd-fuse") == kDefaultPaceLimit && mountPaceLimit("9p") == kDefaultPaceLimit);
+    TEST_CHECK(mountPaceLimit("ceph") == kDefaultPaceLimit && mountPaceLimit("fuse.davfs") == kDefaultPaceLimit);
+    TEST_CHECK(mountPaceLimit("ext4") == 0 && mountPaceLimit("btrfs") == 0 && mountPaceLimit("tmpfs") == 0);
+    TEST_CHECK(mountPaceLimit("fuseblk") == 0 && mountPaceLimit("fuse.encfs") == 0);
 
     // Put a decoy removable file above devices/ to verify the ancestor walk stops at devices/.
     write(fixture.root / "removable", "1");
@@ -546,6 +566,701 @@ namespace {
       TEST_CHECK(reads == 2);
       auto& secondSub = wb.observe(fdB.get(), makedev(0, 2003));
       TEST_CHECK(reads == 2 && &firstSub == &secondSub);
+
+      // Network and slow-FUSE mountinfo fixtures select the expected pacing caps without marking them removable.
+      // FUSE mounts also default to fdatasync() because Linux FUSE clears page writeback on queueing.
+      for (const auto& [fsType, source, expectedLimit, expectDataSync] :
+           std::vector<std::tuple<std::string, std::string, std::size_t, bool>>{
+               {"nfs", "server:/export", kDefaultPaceLimit, false},
+               {"nfs4", "server:/export", kDefaultPaceLimit, false},
+               {"smb3", "//server/share", kSmbPaceLimit, false},
+               {"cifs", "//server/share", kSmbPaceLimit, false},
+               {"fuse.sshfs", "user@host:/dir", kDefaultPaceLimit, true},
+               {"fuse.gvfsd-fuse", "gvfsd-fuse", kDefaultPaceLimit, true},
+               {"tmpfs", "tmpfs", 0, false},
+           }) {
+        luciole::transfer::Writeback netWb;
+        netWb.ops.mountinfo = [&] {
+          return std::format("{} 1 0:3001 / /mnt rw - {} {} rw\n", stxA.stx_mnt_id, fsType, source);
+        };
+        const auto& vol = netWb.observe(fdA.get(), makedev(0, 3001));
+        TEST_CHECK(!vol.removable && vol.paceLimit == expectedLimit && vol.rangeSyncUnsupported == expectDataSync);
+      }
+      // Block-backed FUSE and external Btrfs subvolumes: removable gets 16 MiB pacing; fixed stays unpaced.
+      for (const bool isRemovable : {false, true}) {
+        for (const auto& [fsType, expectDataSync] :
+             std::vector<std::pair<std::string, bool>>{{"fuseblk", isRemovable}, {"btrfs", false}}) {
+          luciole::transfer::Writeback blockWb;
+          blockWb.ops.mountinfo = [&] {
+            return std::format("{} 1 0:3002 / /media/usb rw - {} /dev/sdb1 rw\n", stxA.stx_mnt_id, fsType);
+          };
+          blockWb.ops.removable = [isRemovable](int, dev_t) { return isRemovable; };
+          const auto& vol = blockWb.observe(fdA.get(), makedev(0, 3003));
+          TEST_CHECK(vol.removable == isRemovable);
+          TEST_CHECK(vol.paceLimit == (isRemovable ? kDefaultPaceLimit : 0));
+          TEST_CHECK(vol.rangeSyncUnsupported == expectDataSync);
+        }
+      }
+    }
+  }
+
+  std::string patternedBytes(std::size_t size) {
+    std::string data(size, '\0');
+    for (std::size_t i = 0; i < size; ++i) {
+      data[i] = static_cast<char>((i * 131U + (i >> 8U) * 17U + 7U) & 0xffU);
+    }
+    return data;
+  }
+
+  void testWritebackPacing(Pump& pump) {
+    constexpr std::size_t kMiB = 1024 * 1024;
+    constexpr std::size_t kKiB = 1024;
+
+    // 1. Files below 1 MiB skip helper launches; fixed local disks skip pacing even for multi-MiB files.
+    {
+      Fixture f;
+      const auto justUnder = patternedBytes(kMiB - 1);
+      write(f.source("under.bin"), justUnder);
+      write(f.source("empty.bin"), "");
+      unsigned rangeCalls = 0, dataSyncCalls = 0, closeCalls = 0;
+      luciole::TransferService svc(
+          {.removable = [](int, dev_t) { return true; },
+           .sync = [](int) {},
+           .syncRange =
+               [&](int, std::uint64_t, std::uint64_t) {
+                 ++rangeCalls;
+                 return 0;
+               },
+           .dataSync =
+               [&](int) {
+                 ++dataSyncCalls;
+                 return 0;
+               },
+           .closeFd =
+               [&](luciole::Fd& fd) {
+                 ++closeCalls;
+                 return fd.close();
+               },
+           .allowClone = false}
+      );
+      pump.run(
+          svc, {location(f.source("under.bin")), location(f.source("empty.bin"))}, f.destination(""),
+          TransferAction::Copy
+      );
+      TEST_CHECK(svc.results()[0].outcome == TransferOutcome::Copied);
+      TEST_CHECK(svc.results()[1].outcome == TransferOutcome::Copied);
+      TEST_CHECK(rangeCalls == 0 && dataSyncCalls == 0 && closeCalls == 2 && svc.bytes() == kMiB - 1);
+      TEST_CHECK(read(f.destination("under.bin")) == justUnder && read(f.destination("empty.bin")).empty());
+
+      const auto fixedPayload = patternedBytes(3 * kMiB);
+      write(f.source("fixed.bin"), fixedPayload);
+      luciole::TransferService fixed(
+          {.removable = [](int, dev_t) { return false; },
+           .paceLimit = [](int, dev_t) { return std::size_t{0}; },
+           .sync = [](int) { TEST_CHECK(false); },
+           .syncRange =
+               [&](int, std::uint64_t, std::uint64_t) {
+                 ++rangeCalls;
+                 return 0;
+               },
+           .allowClone = false}
+      );
+      pump.run(fixed, {location(f.source("fixed.bin"))}, f.destination(""), TransferAction::Copy);
+      TEST_CHECK(fixed.results()[0].outcome == TransferOutcome::Copied && rangeCalls == 0);
+      TEST_CHECK(read(f.destination("fixed.bin")) == fixedPayload);
+      f.clean();
+    }
+
+    // 2. Adaptive resizing (2x growth to cap + shrink), mid-file fallback during an in-flight range, short writes,
+    //    trailing partial range, and strictly monotonic one-window lead progress while stalled.
+    {
+      Fixture f;
+      const auto payload = patternedBytes(9 * kMiB + 37 * kKiB);
+      write(f.source("paced.bin"), payload);
+      struct Range {
+        std::uint64_t offset;
+        std::uint64_t length;
+      };
+      std::mutex mu;
+      std::condition_variable cv;
+      std::vector<Range> ranges;
+      std::size_t completedRanges = 0;
+      bool firstEntered = false, firstReleased = false;
+      std::atomic<std::uint64_t> writtenTotal{0};
+      std::atomic<std::int64_t> fakeClock{1'000'000'000};
+      std::atomic<std::uint64_t> maxObservedBytes{0};
+      std::atomic<bool> monotonicOk{true};
+      std::uint64_t rangeCopied = 0;
+
+      luciole::TransferService svc(
+          {.removable = [](int, dev_t) { return false; },
+           .paceLimit = [](int, dev_t) { return 4 * kMiB; },
+           .syncRange =
+               [&](int fd, std::uint64_t offset, std::uint64_t length) {
+                 std::size_t index = 0;
+                 {
+                   const std::scoped_lock lock(mu);
+                   index = ranges.size();
+                   ranges.push_back({offset, length});
+                   if (index == 0) {
+                     firstEntered = true;
+                   }
+                 }
+                 cv.notify_all();
+                 if (index == 0) {
+                   std::unique_lock lock(mu);
+                   cv.wait(lock, [&] { return firstReleased; });
+                 }
+                 // Range 0: 50 ms (1->2 MiB), Range 1: 100 ms (hold 2 MiB), Range 2: 50 ms (2->4 MiB cap),
+                 // Range 3: 3200 ms (shrink to 256 KiB), Range 4+: 200 ms (hold 256 KiB).
+                 const std::int64_t delta = index == 0 || index == 2 ? 50'000'000
+                     : index == 1                                    ? 100'000'000
+                     : index == 3                                    ? 3'200'000'000
+                                                                     : 200'000'000;
+                 fakeClock.fetch_add(delta);
+                 const int rc = ::sync_file_range(
+                     fd, static_cast<off_t>(offset), static_cast<off_t>(length),
+                     SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER
+                 );
+                 {
+                   const std::scoped_lock lock(mu);
+                   ++completedRanges;
+                 }
+                 cv.notify_all();
+                 return rc;
+               },
+           .clockNs = [&] { return fakeClock.load(); },
+           .copyRange = [&](int inFd, int outFd, std::size_t length) -> ssize_t {
+             // Copy 1 MiB + 600 KiB via copy_file_range, forcing mid-file fallback while range #0 is in flight.
+             if (rangeCopied >= kMiB + 600 * kKiB) {
+               errno = EXDEV;
+               return -1;
+             }
+             const auto step = std::min<std::size_t>(length, kMiB + 600 * kKiB - rangeCopied);
+             const auto n = ::copy_file_range(inFd, nullptr, outFd, nullptr, step, 0);
+             if (n > 0) {
+               rangeCopied += static_cast<std::uint64_t>(n);
+               writtenTotal.fetch_add(static_cast<std::uint64_t>(n));
+             }
+             return n;
+           },
+           .writeChunk = [&](int outFd, const void* data, std::size_t length) -> ssize_t {
+             // Gate resize boundaries deterministically so assertions never depend on thread scheduling.
+             const auto soFar = writtenTotal.load();
+             if (soFar == 4 * kMiB) {
+               std::unique_lock lock(mu);
+               cv.wait(lock, [&] { return completedRanges >= 3; });
+             } else if (soFar == 8 * kMiB) {
+               std::unique_lock lock(mu);
+               cv.wait(lock, [&] { return completedRanges >= 4; });
+             }
+             const auto step = std::min<std::size_t>(length, 19 * kKiB);
+             const auto n = ::write(outFd, data, step);
+             if (n > 0) {
+               writtenTotal.fetch_add(static_cast<std::uint64_t>(n));
+               const auto seen = svc.bytes();
+               auto prev = maxObservedBytes.load();
+               while (seen > prev && !maxObservedBytes.compare_exchange_weak(prev, seen)) {
+               }
+               if (seen < prev) {
+                 monotonicOk.store(false);
+               }
+             }
+             return n;
+           },
+           .allowClone = false}
+      );
+      TEST_CHECK(svc.start({{location(f.source("paced.bin"))}, location(f.destination("")), TransferAction::Copy}));
+      {
+        std::unique_lock lock(mu);
+        cv.wait(lock, [&] { return firstEntered; });
+      }
+      // Wait for window #2 (crossing the mid-file fallback) to fill while range #0 is still stalled.
+      pump.until([&] { return writtenTotal.load() >= 2 * kMiB; });
+      TEST_CHECK(svc.busy() && svc.bytes() <= kMiB);
+      {
+        const std::scoped_lock lock(mu);
+        firstReleased = true;
+      }
+      cv.notify_all();
+      std::uint64_t lastPolled = 0;
+      pump.until([&] {
+        const auto current = svc.bytes();
+        TEST_CHECK(current >= lastPolled);
+        lastPolled = current;
+        return !svc.busy();
+      });
+      TEST_CHECK(monotonicOk.load());
+      TEST_CHECK(svc.results()[0].outcome == TransferOutcome::Copied && !svc.results()[0].error);
+      TEST_CHECK(svc.bytes() == payload.size() && read(f.destination("paced.bin")) == payload);
+      TEST_CHECK(ranges.size() == 9);
+      std::uint64_t cursor = 0;
+      for (const auto& range : ranges) {
+        TEST_CHECK(range.offset == cursor && range.length > 0 && range.length <= 4 * kMiB);
+        cursor += range.length;
+      }
+      TEST_CHECK(cursor == payload.size());
+      TEST_CHECK(ranges[0].length == kMiB && ranges[1].length == kMiB);
+      TEST_CHECK(ranges[2].length == 2 * kMiB && ranges[3].length == 4 * kMiB);
+      TEST_CHECK(
+          ranges[4].length == 256 * kKiB
+          && ranges[5].length == 256 * kKiB
+          && ranges[6].length == 256 * kKiB
+          && ranges[7].length == 256 * kKiB
+      );
+      TEST_CHECK(ranges[8].length == 37 * kKiB);
+      f.clean();
+    }
+
+    // 2b. Mid-buffer short write across a window shrink re-applies the updated window limit on the next write retry.
+    {
+      Fixture f;
+      const auto payload = patternedBytes(2 * kMiB);
+      write(f.source("shrink.bin"), payload);
+      std::mutex mu;
+      std::condition_variable cv;
+      std::vector<std::uint64_t> lengths;
+      bool firstEntered = false, firstReleased = false;
+      std::atomic<std::int64_t> clockVal{1'000'000'000};
+      std::uint64_t written = 0;
+      bool checkedShrunkRetry = false;
+      bool sawOversizedRetry = false;
+
+      luciole::TransferService svc(
+          {.removable = [](int, dev_t) { return false; },
+           .paceLimit = [](int, dev_t) { return 4 * kMiB; },
+           .syncRange =
+               [&](int fd, std::uint64_t offset, std::uint64_t length) {
+                 bool first = false;
+                 {
+                   const std::scoped_lock lock(mu);
+                   first = lengths.empty();
+                   lengths.push_back(length);
+                   if (first) {
+                     firstEntered = true;
+                   }
+                 }
+                 cv.notify_all();
+                 if (first) {
+                   std::unique_lock lock(mu);
+                   cv.wait(lock, [&] { return firstReleased; });
+                   // 640 ms for 1 MiB shrinks window to 320 KiB.
+                   clockVal.fetch_add(640'000'000);
+                 } else {
+                   clockVal.fetch_add(200'000'000);
+                 }
+                 return ::sync_file_range(
+                     fd, static_cast<off_t>(offset), static_cast<off_t>(length),
+                     SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER
+                 );
+               },
+           .clockNs = [&] { return clockVal.load(); },
+           .copyRange = [](int, int, std::size_t) -> ssize_t {
+             errno = EXDEV;
+             return -1;
+           },
+           .writeChunk = [&](int outFd, const void* data, std::size_t length) -> ssize_t {
+             if (written == kMiB + 256 * kKiB) {
+               {
+                 std::unique_lock lock(mu);
+                 cv.wait(lock, [&] { return firstEntered; });
+                 firstReleased = true;
+               }
+               cv.notify_all();
+             }
+             if (written >= kMiB + 256 * kKiB && written < kMiB + 320 * kKiB) {
+               if (svc.bytes() > kMiB) {
+                 // Window #0 completion was harvested mid-buffer and shrunk the window to 320 KiB.
+                 checkedShrunkRetry = true;
+                 if (length > (kMiB + 320 * kKiB) - written) {
+                   sawOversizedRetry = true;
+                 }
+               } else {
+                 // Take tiny short writes inside the same 128 KiB buffer until harvestIfDone() observes range #0.
+                 std::this_thread::yield();
+                 const auto n = ::write(outFd, data, std::min<std::size_t>(length, 1024));
+                 if (n > 0) {
+                   written += static_cast<std::uint64_t>(n);
+                 }
+                 return n;
+               }
+             }
+             const auto n = ::write(outFd, data, length);
+             if (n > 0) {
+               written += static_cast<std::uint64_t>(n);
+             }
+             return n;
+           },
+           .allowClone = false}
+      );
+      pump.run(svc, {location(f.source("shrink.bin"))}, f.destination(""), TransferAction::Copy);
+      TEST_CHECK(svc.results()[0].outcome == TransferOutcome::Copied && checkedShrunkRetry && !sawOversizedRetry);
+      TEST_CHECK(lengths.size() >= 3 && lengths[1] == 320 * kKiB);
+      TEST_CHECK(read(f.destination("shrink.bin")) == payload);
+      f.clean();
+    }
+
+    // 3. Unsupported sync_file_range falls back to checked fdatasync() on the same helper and caches per volume;
+    //    real writeback errors (ENOSPC/EIO) propagate without fallback.
+    {
+      Fixture f;
+      const auto firstBig = patternedBytes(2 * kMiB + 64 * kKiB);
+      const auto secondBig = patternedBytes(1 * kMiB + 512 * kKiB);
+      const auto smallFile = patternedBytes(128 * kKiB);
+      write(f.source("a_big.bin"), firstBig);
+      write(f.source("b_big.bin"), secondBig);
+      write(f.source("c_small.bin"), smallFile);
+
+      std::mutex mu;
+      std::condition_variable cv;
+      unsigned syncRangeCalls = 0, dataSyncCalls = 0;
+      bool secondSyncEntered = false, secondSyncReleased = false;
+      std::atomic<std::int64_t> syncClock{1'000'000'000};
+
+      luciole::TransferService fallback(
+          {.removable = [](int, dev_t) { return false; },
+           .paceLimit = [](int, dev_t) { return 4 * kMiB; },
+           .syncRange =
+               [&](int, std::uint64_t, std::uint64_t) {
+                 ++syncRangeCalls;
+                 errno = EOPNOTSUPP;
+                 return -1;
+               },
+           .dataSync =
+               [&](int fd) {
+                 unsigned call = 0;
+                 {
+                   const std::scoped_lock lock(mu);
+                   call = ++dataSyncCalls;
+                   if (call == 2) {
+                     secondSyncEntered = true;
+                   }
+                 }
+                 cv.notify_all();
+                 if (call == 2) {
+                   std::unique_lock lock(mu);
+                   cv.wait(lock, [&] { return secondSyncReleased; });
+                 }
+                 // Keep the adaptive window steady at 1 MiB (200 ms per MiB).
+                 syncClock.fetch_add(200'000'000);
+                 return ::fdatasync(fd);
+               },
+           .clockNs = [&] { return syncClock.load(); },
+           .allowClone = false}
+      );
+      TEST_CHECK(fallback.start(
+          {{location(f.source("a_big.bin")), location(f.source("b_big.bin")), location(f.source("c_small.bin"))},
+           location(f.destination("")),
+           TransferAction::Copy}
+      ));
+      {
+        std::unique_lock lock(mu);
+        cv.wait(lock, [&] { return secondSyncEntered; });
+      }
+      // While Window #2's fdatasync is stalled, progress must not advance past Window #1.
+      TEST_CHECK(fallback.bytes() == kMiB);
+      {
+        const std::scoped_lock lock(mu);
+        secondSyncReleased = true;
+      }
+      cv.notify_all();
+      pump.until([&] { return !fallback.busy(); });
+      // sync_file_range tried once for the volume; a_big (3 windows) + b_big (2 windows) = 5 fdatasync calls; c_small =
+      // 0.
+      TEST_CHECK(syncRangeCalls == 1 && dataSyncCalls == 5);
+      TEST_CHECK(fallback.bytes() == firstBig.size() + secondBig.size() + smallFile.size());
+      TEST_CHECK(read(f.destination("a_big.bin")) == firstBig);
+      TEST_CHECK(read(f.destination("b_big.bin")) == secondBig);
+      TEST_CHECK(read(f.destination("c_small.bin")) == smallFile);
+
+      // Real ENOSPC on sync_file_range propagates immediately without calling fdatasync.
+      unsigned errDataSync = 0;
+      luciole::TransferService noSpace(
+          {.removable = [](int, dev_t) { return false; },
+           .paceLimit = [](int, dev_t) { return 4 * kMiB; },
+           .syncRange =
+               [](int, std::uint64_t, std::uint64_t) {
+                 errno = ENOSPC;
+                 return -1;
+               },
+           .dataSync =
+               [&](int) {
+                 ++errDataSync;
+                 return 0;
+               },
+           .allowClone = false}
+      );
+      write(f.source("nospace.bin"), firstBig);
+      pump.run(noSpace, {location(f.source("nospace.bin"))}, f.destination(""), TransferAction::Copy);
+      TEST_CHECK(noSpace.results()[0].outcome == TransferOutcome::Failed && errDataSync == 0);
+      TEST_CHECK(noSpace.results()[0].error && noSpace.results()[0].error->kind == luciole::FileErrorKind::NoSpace);
+
+      // EIO from fallback fdatasync propagates as an error.
+      luciole::TransferService syncFail(
+          {.removable = [](int, dev_t) { return false; },
+           .paceLimit = [](int, dev_t) { return 4 * kMiB; },
+           .syncRange =
+               [](int, std::uint64_t, std::uint64_t) {
+                 errno = ENOSYS;
+                 return -1;
+               },
+           .dataSync =
+               [](int) {
+                 errno = EIO;
+                 return -1;
+               },
+           .allowClone = false}
+      );
+      pump.run(syncFail, {location(f.source("nospace.bin"))}, f.destination(""), TransferAction::Copy);
+      TEST_CHECK(syncFail.results()[0].outcome == TransferOutcome::Failed);
+      TEST_CHECK(syncFail.results()[0].error && syncFail.results()[0].error->kind == luciole::FileErrorKind::Other);
+      f.clean();
+    }
+
+    // 4. Delayed close() errors fail both small (< 1 MiB) and large paced copies.
+    {
+      Fixture f;
+      write(f.source("small.bin"), patternedBytes(128 * kKiB));
+      write(f.source("large.bin"), patternedBytes(2 * kMiB + 128 * kKiB));
+      for (const auto& [name, errCode, expectedKind] :
+           std::vector<std::tuple<std::string, int, luciole::FileErrorKind>>{
+               {"small.bin", EIO, luciole::FileErrorKind::Other},
+               {"large.bin", ENOSPC, luciole::FileErrorKind::NoSpace},
+           }) {
+        luciole::TransferService svc(
+            {.removable = [](int, dev_t) { return true; },
+             .sync = [](int) {},
+             .closeFd =
+                 [errCode](luciole::Fd& fd) {
+                   (void)fd.close();
+                   errno = errCode;
+                   return -1;
+                 },
+             .allowClone = false}
+        );
+        pump.run(svc, {location(f.source(name))}, f.destination(""), TransferAction::Copy);
+        TEST_CHECK(svc.results()[0].outcome == TransferOutcome::Failed && !fs::exists(f.destination(name)));
+        TEST_CHECK(svc.results()[0].error && svc.results()[0].error->kind == expectedKind);
+      }
+      f.clean();
+    }
+
+    // 5. Stalled-range cancellation hands off sole ownership of output fd and stage cleanup to the detached helper.
+    {
+      Fixture f;
+      write(f.source("stall.bin"), patternedBytes(3 * kMiB));
+      std::mutex mu;
+      std::condition_variable cv;
+      bool entered = false, released = false;
+      std::atomic<unsigned> closeCount{0};
+      std::atomic<bool> stageExistedAtClose{false};
+      fs::path stageDir;
+
+      {
+        luciole::TransferService svc(
+            {.removable = [](int, dev_t) { return true; },
+             .sync = [](int) { TEST_CHECK(false); },
+             .syncRange =
+                 [&](int, std::uint64_t, std::uint64_t) {
+                   {
+                     const std::scoped_lock lock(mu);
+                     entered = true;
+                   }
+                   cv.notify_all();
+                   std::unique_lock lock(mu);
+                   cv.wait(lock, [&] { return released; });
+                   return 0;
+                 },
+             .closeFd =
+                 [&](luciole::Fd& fd) {
+                   stageExistedAtClose.store(
+                       !stageDir.empty() && fs::is_directory(stageDir) && fs::is_regular_file(stageDir / "item")
+                   );
+                   closeCount.fetch_add(1);
+                   return fd.close();
+                 },
+             .allowClone = false}
+        );
+        TEST_CHECK(svc.start({{location(f.source("stall.bin"))}, location(f.destination("")), TransferAction::Copy}));
+        {
+          std::unique_lock lock(mu);
+          cv.wait(lock, [&] { return entered; });
+        }
+        for (const auto& entry : fs::directory_iterator(f.destination(""))) {
+          if (entry.path().filename().native().starts_with(".luciole-transfer-")) {
+            stageDir = entry.path();
+          }
+        }
+        TEST_CHECK(!stageDir.empty() && closeCount.load() == 0);
+        svc.cancel();
+        // Cancellation must complete while sync_file_range is still held.
+        pump.until([&] { return !svc.busy(); });
+        TEST_CHECK(svc.results()[0].outcome == TransferOutcome::Cancelled);
+        TEST_CHECK(closeCount.load() == 0 && fs::is_directory(stageDir) && fs::is_regular_file(stageDir / "item"));
+        TEST_CHECK(luciole::transfer::cleanupPending());
+      } // TransferService destroyed before the stalled syscall returns!
+
+      {
+        const std::scoped_lock lock(mu);
+        released = true;
+      }
+      cv.notify_all();
+      drainHistoryCleanup();
+      TEST_CHECK(closeCount.load() == 1 && stageExistedAtClose.load());
+      TEST_CHECK(!fs::exists(stageDir) && !fs::exists(f.destination("stall.bin")));
+      TEST_CHECK(luciole::transfer::takeCleanupErrors().empty());
+      f.clean();
+    }
+
+    // 6. Multi-item job: an already-published first item still flushes when a nested directory copy stalls and cancels.
+    {
+      Fixture f;
+      write(f.source("first.txt"), "published before stall");
+      fs::create_directories(f.source("folder/nested"));
+      write(f.source("folder/nested/big.bin"), patternedBytes(3 * kMiB));
+      std::mutex mu;
+      std::condition_variable cv;
+      bool entered = false, released = false;
+      std::atomic<unsigned> finalSyncs{0}, closeCount{0};
+      fs::path stageDir;
+
+      luciole::TransferService svc(
+          {.removable = [](int, dev_t) { return true; },
+           .sync = [&](int) { finalSyncs.fetch_add(1); },
+           .syncRange =
+               [&](int, std::uint64_t, std::uint64_t) {
+                 {
+                   const std::scoped_lock lock(mu);
+                   entered = true;
+                 }
+                 cv.notify_all();
+                 std::unique_lock lock(mu);
+                 cv.wait(lock, [&] { return released; });
+                 return 0;
+               },
+           .closeFd =
+               [&](luciole::Fd& fd) {
+                 closeCount.fetch_add(1);
+                 return fd.close();
+               },
+           .allowClone = false}
+      );
+      TEST_CHECK(svc.start(
+          {{location(f.source("first.txt")), location(f.source("folder"))},
+           location(f.destination("")),
+           TransferAction::Copy}
+      ));
+      {
+        std::unique_lock lock(mu);
+        cv.wait(lock, [&] { return entered; });
+      }
+      for (const auto& entry : fs::directory_iterator(f.destination(""))) {
+        if (entry.path().filename().native().starts_with(".luciole-transfer-")) {
+          stageDir = entry.path();
+        }
+      }
+      TEST_CHECK(!stageDir.empty());
+      svc.cancel();
+      pump.until([&] { return !svc.busy(); });
+      TEST_CHECK(svc.results()[0].outcome == TransferOutcome::Copied && finalSyncs.load() == 1);
+      TEST_CHECK(svc.results()[1].outcome == TransferOutcome::Cancelled);
+      TEST_CHECK(read(f.destination("first.txt")) == "published before stall");
+      TEST_CHECK(closeCount.load() == 1 && fs::is_directory(stageDir)); // 1 close was first.txt; big.bin still held.
+      {
+        const std::scoped_lock lock(mu);
+        released = true;
+      }
+      cv.notify_all();
+      drainHistoryCleanup();
+      TEST_CHECK(closeCount.load() == 2 && !fs::exists(stageDir) && !fs::exists(f.destination("folder")));
+      TEST_CHECK(luciole::transfer::takeCleanupErrors().empty());
+      f.clean();
+    }
+
+    // 7. Detached cleanup reports close errors and refuses to delete a tampered stage directory, naming the stage path.
+    for (const bool tamperStage : {false, true}) {
+      Fixture f;
+      write(f.source("err.bin"), patternedBytes(3 * kMiB));
+      std::mutex mu;
+      std::condition_variable cv;
+      bool entered = false, released = false;
+      fs::path stageDir;
+
+      luciole::TransferService svc(
+          {.removable = [](int, dev_t) { return true; },
+           .sync = [](int) {},
+           .syncRange =
+               [&](int, std::uint64_t, std::uint64_t) {
+                 {
+                   const std::scoped_lock lock(mu);
+                   entered = true;
+                 }
+                 cv.notify_all();
+                 std::unique_lock lock(mu);
+                 cv.wait(lock, [&] { return released; });
+                 return 0;
+               },
+           .closeFd =
+               [tamperStage](luciole::Fd& fd) {
+                 (void)fd.close();
+                 if (!tamperStage) {
+                   errno = EIO;
+                   return -1;
+                 }
+                 return 0;
+               },
+           .allowClone = false}
+      );
+      TEST_CHECK(svc.start({{location(f.source("err.bin"))}, location(f.destination("")), TransferAction::Copy}));
+      {
+        std::unique_lock lock(mu);
+        cv.wait(lock, [&] { return entered; });
+      }
+      for (const auto& entry : fs::directory_iterator(f.destination(""))) {
+        if (entry.path().filename().native().starts_with(".luciole-transfer-")) {
+          stageDir = entry.path();
+        }
+      }
+      svc.cancel();
+      pump.until([&] { return !svc.busy(); });
+      fs::path movedAside;
+      if (tamperStage) {
+        movedAside = f.destination("moved-original-stage");
+        fs::rename(stageDir, movedAside);
+        fs::create_directory(stageDir);
+        write(stageDir / "decoy.txt", "do not delete");
+      }
+      {
+        const std::scoped_lock lock(mu);
+        released = true;
+      }
+      cv.notify_all();
+      drainHistoryCleanup();
+      const auto errors = luciole::transfer::takeCleanupErrors();
+      TEST_CHECK(errors.size() == 1 && errors[0].message.contains(stageDir.native()));
+      if (tamperStage) {
+        TEST_CHECK(read(stageDir / "decoy.txt") == "do not delete");
+      } else {
+        TEST_CHECK(!fs::exists(stageDir) && errors[0].message.contains("Close failed"));
+      }
+    }
+
+    // 8. OperationHistory Copy Undo/Redo inherits the paced copy loop cleanly.
+    {
+      Fixture f;
+      const auto payload = patternedBytes(2 * kMiB + 200 * kKiB);
+      write(f.source("hist.bin"), payload);
+      luciole::TransferService svc({.removable = [](int, dev_t) { return true; }});
+      svc.useOperationHistory();
+      pump.run(svc, {location(f.source("hist.bin"))}, f.destination(""), TransferAction::Copy);
+      auto receipt = svc.takeCopyReceipt();
+      TEST_CHECK(receipt && read(f.destination("hist.bin")) == payload);
+      pump.replayCopy(svc, receipt);
+      receipt = svc.takeCopyReceipt();
+      TEST_CHECK(receipt && !fs::exists(f.destination("hist.bin")));
+      pump.replayCopy(svc, receipt);
+      TEST_CHECK(svc.copyReceipt() && read(f.destination("hist.bin")) == payload);
+      f.clean();
     }
   }
   void testCopyHistory(Pump& pump) {
@@ -5102,6 +5817,49 @@ namespace {
       TEST_CHECK(::umount(second.c_str()) == 0);
       TEST_CHECK(::umount(first.c_str()) == 0);
     }
+
+    // Mount crossing during a merge: fixed branch stays unpaced while paced branch paces its >= 1 MiB file.
+    {
+      Fixture cross;
+      const auto srcTree = cross.source("tree"), dstTree = cross.destination("tree");
+      for (const auto* branch : {"fixed", "paced"}) {
+        fs::create_directories(srcTree / branch);
+        fs::create_directories(dstTree / branch);
+        TEST_CHECK(::mount("tmpfs", (dstTree / branch).c_str(), "tmpfs", 0, "size=8M") == 0);
+        write(srcTree / branch / "big.bin", patternedBytes(2 * 1024 * 1024 + 32 * 1024));
+      }
+      struct stat pacedStat{};
+      TEST_CHECK(::stat((dstTree / "paced").c_str(), &pacedStat) == 0);
+      unsigned rangeCalls = 0, fixedRangeCalls = 0;
+      luciole::TransferService svc(
+          {.removable = [](int, dev_t) { return false; },
+           .paceLimit = [&](int, dev_t dev) -> std::size_t {
+             return dev == pacedStat.st_dev ? luciole::transfer::kDefaultPaceLimit : 0;
+           },
+           .syncRange =
+               [&](int fd, std::uint64_t offset, std::uint64_t length) {
+                 if (luciole::statFd(fd).st_dev == pacedStat.st_dev) {
+                   ++rangeCalls;
+                 } else {
+                   ++fixedRangeCalls;
+                 }
+                 return ::sync_file_range(
+                     fd, static_cast<off_t>(offset), static_cast<off_t>(length),
+                     SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER
+                 );
+               }}
+      );
+      pump.run(svc, {location(srcTree)}, cross.destination(""), TransferAction::Copy, [](const auto&) {
+        return TransferConflictChoice::Merge;
+      });
+      TEST_CHECK(svc.results()[0].outcome == TransferOutcome::Copied);
+      TEST_CHECK(rangeCalls >= 2 && fixedRangeCalls == 0);
+      svc.takeCopyReceipt().reset();
+      drainHistoryCleanup();
+      for (const auto* branch : {"fixed", "paced"}) {
+        TEST_CHECK(::umount((dstTree / branch).c_str()) == 0);
+      }
+    }
   }
 
   std::size_t threadCount() {
@@ -5198,6 +5956,7 @@ int main(int argc, char** argv) {
     testSymbolicLinkDrops(pump);
     testRemovableDevices();
     testWriteback(pump);
+    testWritebackPacing(pump);
     testCopyHistory(pump);
     testCopyHistoryGuards(pump);
     testCopyHistoryRetention(pump);
@@ -5269,8 +6028,9 @@ int main(int argc, char** argv) {
     testMergeBindings(pump);
     testRetry(pump);
     testMergeLimitsAndNewEntries(pump);
-    pump.until([] { return !luciole::CopyReceipt::cleanupPending(); });
+    pump.until([] { return !luciole::CopyReceipt::cleanupPending() && !luciole::transfer::cleanupPending(); });
     TEST_CHECK(luciole::CopyReceipt::takeCleanupErrors().empty());
+    TEST_CHECK(luciole::transfer::takeCleanupErrors().empty());
     std::println("Transfer checks passed");
     return 0;
   } catch (const std::exception& error) {

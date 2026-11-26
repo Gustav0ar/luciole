@@ -3,6 +3,7 @@
 #include "fs/gio_interop.h"
 #include "fs/posix_fd.h"
 #include "operations/copy_receipt.h"
+#include "operations/transfer_pacing.h"
 #include "operations/transfer_writeback.h"
 #include "operations/trash_item.h"
 #include "test_check.h"
@@ -52,6 +53,18 @@ namespace {
         std::vector<pollfd> fds;
         const auto first = m_source.addPollFds(fds);
         TEST_CHECK(::poll(fds.data(), fds.size(), 1) >= 0);
+        m_source.dispatch(fds, first);
+      }
+    }
+    void untilTimer(const std::function<bool()>& done) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!done()) {
+        TEST_CHECK(std::chrono::steady_clock::now() < deadline);
+        std::vector<pollfd> fds;
+        const auto first = m_source.addPollFds(fds);
+        const int timeout = m_source.pollTimeoutMs();
+        TEST_CHECK(timeout >= 0);
+        TEST_CHECK(::poll(fds.data(), fds.size(), timeout) >= 0);
         m_source.dispatch(fds, first);
       }
     }
@@ -1204,6 +1217,67 @@ namespace {
     const auto results = workspace.hub.activities();
     TEST_CHECK(results.size() == 1 && results[0].finished && results[0].state == ActivityState::Cancelled);
   }
+  void cancelledPacedTransferCleanup(Pump& pump) {
+    Fixture fixture;
+    {
+      std::ofstream out(fixture.root / "big.bin", std::ios::binary);
+      const std::string block(1024 * 1024, 'P');
+      out << block << block << block;
+    }
+    std::binary_semaphore entered{0}, release{0};
+    Workspace workspace;
+    auto job = workspace.hub.create<luciole::TransferService>(
+        workspace.page, JobScope::Follow,
+        luciole::transfer::WritebackOps{
+            .removable = [](int, dev_t) { return true; },
+            .sync = [](int) {},
+            .syncRange =
+                [&](int, std::uint64_t, std::uint64_t) {
+                  entered.release();
+                  release.acquire();
+                  return 0;
+                },
+            .closeFd =
+                [](luciole::Fd& fd) {
+                  (void)fd.close();
+                  errno = EIO;
+                  return -1;
+                },
+            .allowClone = false,
+        }
+    );
+    auto& service = job->service<luciole::TransferService>();
+    TEST_CHECK(service.start({{fixture.at("big.bin")}, fixture.at("destination"), luciole::TransferAction::Copy}));
+    entered.acquire();
+    std::string stagePath;
+    for (const auto& entry : fs::directory_iterator(fixture.root / "destination")) {
+      if (entry.path().filename().native().starts_with(".luciole-transfer-")) {
+        stagePath = entry.path().native();
+      }
+    }
+    TEST_CHECK(!stagePath.empty());
+    TEST_CHECK(workspace.hub.cancelActivity(job->id()));
+    pump.until([&] { return !service.busy(); });
+    // App stays usable while detached cleanup runs; shutdown and removal of this mount wait, unrelated mounts do not.
+    TEST_CHECK(!workspace.hub.busy() && workspace.hub.shutdownPending());
+    TEST_CHECK(!workspace.hub.removalReady(fixture.at("destination")));
+    TEST_CHECK(workspace.hub.removalReady(luciole::Location::fromPath("/proc")));
+    // A hung cleanup must wake the GLib main loop and release shutdown once the shutdown timeout expires.
+    workspace.hub.shutdown(std::chrono::milliseconds(50));
+    pump.untilTimer([&] { return !workspace.hub.shutdownPending(); });
+    TEST_CHECK(luciole::transfer::cleanupPending());
+    workspace.hub.shutdown(std::chrono::milliseconds(50));
+    TEST_CHECK(!workspace.hub.shutdownPending());
+    release.release();
+    pump.until([] { return !luciole::transfer::cleanupPending(); });
+    TEST_CHECK(!workspace.hub.shutdownPending() && workspace.hub.removalReady(fixture.at("destination")));
+    workspace.hub.update(workspace.window);
+    const auto activities = workspace.hub.activities();
+    const auto found = std::ranges::find_if(activities, [](const auto& item) {
+      return item.title == "Clean up cancelled transfer" && item.state == ActivityState::Failed && item.report;
+    });
+    TEST_CHECK(found != activities.end() && found->report->contains(stagePath));
+  }
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1240,5 +1314,6 @@ int main(int argc, char** argv) {
   ancestorTransferHistory(pump, luciole::TransferAction::Copy);
   ancestorTransferHistory(pump, luciole::TransferAction::Move);
   copyCleanupReport(pump);
-  pump.until([] { return !luciole::CopyReceipt::cleanupPending(); });
+  cancelledPacedTransferCleanup(pump);
+  pump.until([] { return !luciole::CopyReceipt::cleanupPending() && !luciole::transfer::cleanupPending(); });
 }

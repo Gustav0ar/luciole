@@ -3,6 +3,7 @@
 #include "fs/posix_fd.h"
 #include "fs/transfer_types.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -10,22 +11,44 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <sys/types.h>
 #include <vector>
 
 namespace luciole::transfer {
+  constexpr std::size_t kDefaultPaceLimit = 16 * 1024 * 1024;
+  constexpr std::size_t kSmbPaceLimit = 128 * 1024 * 1024;
+
   bool removableBlockDevice(const std::filesystem::path& device);
+  struct MountInfo {
+    dev_t filesystem;
+    std::string type;
+    std::string source;
+  };
   struct BlockMount {
     dev_t filesystem;
     std::string source;
   };
+  // Resolves mountId from a mountinfo snapshot, regardless of filesystem type.
+  std::optional<MountInfo> mountInfo(std::string_view mountinfo, std::uint64_t mountId);
   // Resolves mountId from mountinfo; sets *found when the mount entry exists even if not block-backed.
   std::optional<BlockMount> blockMount(std::string_view mountinfo, std::uint64_t mountId, bool* found = nullptr);
+  // Returns the adaptive writeback pacing cap for a mounted filesystem type, or 0 for unpaced local disks.
+  std::size_t mountPaceLimit(std::string_view type);
 
-  // Worker-side operations. Tests can hold a flush, return a delayed I/O error, or supply mountinfo snapshots.
+  // Worker-side operations. Tests can hold a flush, pace or stall range syncs, return delayed I/O errors,
+  // or supply mountinfo snapshots.
   struct WritebackOps {
     std::function<bool(int, dev_t)> removable = nullptr;
+    std::function<std::size_t(int, dev_t)> paceLimit = nullptr;
     std::function<void(int)> sync = nullptr;
+    std::function<int(int, std::uint64_t, std::uint64_t)> syncRange = nullptr;
+    std::function<int(int)> dataSync = nullptr;
+    std::function<int(Fd&)> closeFd = nullptr;
+    std::function<std::int64_t()> clockNs = nullptr;
+    std::function<ssize_t(int, int, std::size_t)> copyRange = nullptr;
+    std::function<ssize_t(int, const void*, std::size_t)> writeChunk = nullptr;
     std::function<std::string()> mountinfo = nullptr;
+    bool allowClone = true;
   };
 
   class Writeback {
@@ -33,6 +56,8 @@ namespace luciole::transfer {
     struct Volume {
       Fd directory;
       bool removable = false;
+      std::size_t paceLimit = 0;
+      bool rangeSyncUnsupported = false;
       std::vector<TransferResult*> published;
       std::optional<FileError> failure;
     };

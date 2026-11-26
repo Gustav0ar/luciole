@@ -22,6 +22,8 @@ namespace luciole {
   class HistoryRevisions;
 }
 namespace luciole::transfer {
+  class AbandonedCleanup;
+  struct WritebackOps;
   struct TransferCancelled : FileErrorException {
     TransferCancelled() : FileErrorException({.kind = FileErrorKind::Cancelled, .message = "Transfer cancelled."}) {}
   };
@@ -53,6 +55,12 @@ namespace luciole::transfer {
     // Kernel copy paths the destination filesystem rejected; later files skip straight to the next one.
     bool cloneUnsupported = false;
     bool rangeUnsupported = false;
+    // Active destination pacing cap (0 disables pacing on fixed local disks).
+    std::size_t paceLimit = 0;
+    bool* rangeSyncUnsupported = nullptr;
+    const WritebackOps* writebackOps = nullptr;
+    std::function<void()> prepareAsyncStage;
+    std::shared_ptr<AbandonedCleanup> abandonedCleanup;
     struct stat expected(const struct stat& original) const;
     void note(const struct stat& value);
     void noteUnlinked(const struct stat& value);

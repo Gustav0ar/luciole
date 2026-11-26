@@ -494,7 +494,7 @@ bool WorkspaceApplication::running() {
     m_hub.shutdown();
   }
   m_hub.update(m_focused);
-  bool busy = m_hub.busy() || m_thumbnails.clearing() || m_pins.busy();
+  bool busy = (live ? m_hub.busy() : m_hub.shutdownPending()) || m_thumbnails.clearing() || m_pins.busy();
   for (auto& [id, page] : m_pages) {
     if (!live) {
       page->shutdown();

@@ -1,14 +1,19 @@
 #include "operations/transfer_writeback.h"
 
 #include "fs/gio_ptr.h"
+#include "fs/system_mounts.h"
 #include "operations/transfer_copy.h"
 
+#include <algorithm>
+#include <array>
 #include <fcntl.h>
 #include <format>
 #include <fstream>
+#include <linux/magic.h>
 #include <set>
 #include <sstream>
 #include <sys/sysmacros.h>
+#include <sys/vfs.h>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -80,46 +85,78 @@ namespace {
     return std::move(contents).str();
   }
 
-  std::optional<luciole::transfer::BlockMount>
-  backingMount(int fd, std::optional<std::string>& snapshot, const std::function<std::string()>& reader) {
+  std::optional<luciole::transfer::MountInfo>
+  resolveMount(int fd, std::optional<std::string>& snapshot, const std::function<std::string()>& reader) {
     struct statx mount{};
     if (::statx(fd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_MNT_ID, &mount) != 0
         || !(mount.stx_mask & STATX_MNT_ID)) {
       return {};
     }
     if (snapshot) {
-      bool found = false;
-      auto entry = luciole::transfer::blockMount(*snapshot, mount.stx_mnt_id, &found);
-      if (found) {
+      if (auto entry = luciole::transfer::mountInfo(*snapshot, mount.stx_mnt_id)) {
         return entry;
       }
     }
     snapshot = readMountinfo(reader);
-    return luciole::transfer::blockMount(*snapshot, mount.stx_mnt_id);
+    return luciole::transfer::mountInfo(*snapshot, mount.stx_mnt_id);
+  }
+
+  bool fuseMountType(std::string_view type) { return type == "fuse" || type == "fuseblk" || type.starts_with("fuse."); }
+
+  bool isFuseStatfs(int directory) {
+    struct statfs fs{};
+    return ::fstatfs(directory, &fs) == 0 && fs.f_type == FUSE_SUPER_MAGIC;
+  }
+
+  std::size_t statfsPaceLimit(int directory) {
+    struct statfs fs{};
+    if (::fstatfs(directory, &fs) != 0) {
+      return 0;
+    }
+    if (fs.f_type == CIFS_SUPER_MAGIC || fs.f_type == SMB2_SUPER_MAGIC) {
+      return luciole::transfer::kSmbPaceLimit;
+    }
+    if (
+        fs.f_type == NFS_SUPER_MAGIC
+#ifdef AFS_SUPER_MAGIC
+        || fs.f_type == AFS_SUPER_MAGIC
+#endif
+#ifdef SMB_SUPER_MAGIC
+        || fs.f_type == SMB_SUPER_MAGIC
+#endif
+#ifdef NCP_SUPER_MAGIC
+        || fs.f_type == NCP_SUPER_MAGIC
+#endif
+#ifdef CODA_SUPER_MAGIC
+        || fs.f_type == CODA_SUPER_MAGIC
+#endif
+#ifdef V9FS_MAGIC
+        || fs.f_type == V9FS_MAGIC
+#endif
+#ifdef CEPH_SUPER_MAGIC
+        || fs.f_type == CEPH_SUPER_MAGIC
+#endif
+    ) {
+      return luciole::transfer::kDefaultPaceLimit;
+    }
+    return 0;
   }
 } // namespace
 
 namespace luciole::transfer {
-  std::optional<BlockMount> blockMount(std::string_view mountinfo, std::uint64_t mountId, bool* found) {
-    if (found) {
-      *found = false;
-    }
+  std::optional<MountInfo> mountInfo(std::string_view mountinfo, std::uint64_t mountId) {
     const auto prefix = std::to_string(mountId) + " ";
     while (!mountinfo.empty()) {
       const auto end = mountinfo.find('\n');
       const auto line = mountinfo.substr(0, end);
       if (line.starts_with(prefix)) {
-        if (found) {
-          *found = true;
-        }
         const auto separator = line.find(" - ");
         if (separator == line.npos) {
           return {};
         }
         std::istringstream fields(std::string(line.substr(separator + 3)));
         std::string type, source;
-        fields >> type >> source;
-        if (!source.starts_with("/dev/")) {
+        if (!(fields >> type >> source)) {
           return {};
         }
         std::istringstream ids(std::string(line.substr(prefix.size(), separator - prefix.size())));
@@ -129,11 +166,67 @@ namespace luciole::transfer {
           return {};
         }
         const GString decoded(g_strcompress(source.c_str()));
-        return BlockMount{makedev(majorId, minorId), decoded.get()};
+        return MountInfo{makedev(majorId, minorId), std::move(type), decoded.get()};
       }
       mountinfo.remove_prefix(end == mountinfo.npos ? mountinfo.size() : end + 1);
     }
     return {};
+  }
+
+  std::optional<BlockMount> blockMount(std::string_view mountinfo, std::uint64_t mountId, bool* found) {
+    const auto entry = mountInfo(mountinfo, mountId);
+    if (found) {
+      *found = entry.has_value();
+    }
+    if (!entry || !entry->source.starts_with("/dev/")) {
+      return {};
+    }
+    return BlockMount{entry->filesystem, entry->source};
+  }
+
+  std::size_t mountPaceLimit(std::string_view type) {
+    if (type == "cifs" || type == "smb3") {
+      return kSmbPaceLimit;
+    }
+    if (networkMountType(type)) {
+      return kDefaultPaceLimit;
+    }
+    static constexpr std::array<std::string_view, 33> kSlowMounts{
+        "9p",
+        "afs",
+        "ceph",
+        "coda",
+        "davfs",
+        "glusterfs",
+        "lustre",
+        "orangefs",
+        "pvfs2",
+        "fuse.afpfs",
+        "fuse.ceph",
+        "fuse.curlftpfs",
+        "fuse.davfs",
+        "fuse.davfs2",
+        "fuse.ftpfs",
+        "fuse.gcsfuse",
+        "fuse.glusterfs",
+        "fuse.google-drive-ocamlfuse",
+        "fuse.gphotofs",
+        "fuse.gvfsd-fuse",
+        "fuse.ifuse",
+        "fuse.jmtpfs",
+        "fuse.kio-fuse",
+        "fuse.mtpfs",
+        "fuse.obexfs",
+        "fuse.onedrive",
+        "fuse.rclone",
+        "fuse.s3fs",
+        "fuse.s3ql",
+        "fuse.sftp",
+        "fuse.simple-mtpfs",
+        "fuse.smbnetfs",
+        "fuse.sshfs",
+    };
+    return std::ranges::contains(kSlowMounts, type) ? kDefaultPaceLimit : 0;
   }
 
   bool removableBlockDevice(const fs::path& device) {
@@ -154,8 +247,10 @@ namespace luciole::transfer {
     auto it = m_volumes.find(device);
     if (it == m_volumes.end()) {
       dev_t backing = device, filesystem = device;
+      std::optional<MountInfo> mount;
       if (major(device) == 0) {
-        if (const auto mount = backingMount(directory, m_mountinfo, ops.mountinfo)) {
+        mount = resolveMount(directory, m_mountinfo, ops.mountinfo);
+        if (mount && mount->source.starts_with("/dev/")) {
           filesystem = mount->filesystem;
           struct stat block{};
           if (::stat(mount->source.c_str(), &block) == 0 && S_ISBLK(block.st_mode)) {
@@ -171,6 +266,20 @@ namespace luciole::transfer {
         entry->second.removable = ops.removable ? ops.removable(directory, device)
                                                 : major(backing) != 0
                 && removableBlockDevice(std::format("/sys/dev/block/{}:{}", major(backing), minor(backing)));
+        if (ops.paceLimit) {
+          entry->second.paceLimit = ops.paceLimit(directory, device);
+        } else if (entry->second.removable) {
+          entry->second.paceLimit = kDefaultPaceLimit;
+        } else if (mount) {
+          entry->second.paceLimit = mountPaceLimit(mount->type);
+        } else if (major(device) == 0) {
+          entry->second.paceLimit = statfsPaceLimit(directory);
+        }
+        // Linux FUSE writeback clears page writeback on queueing, so sync_file_range() cannot wait for daemon writes.
+        if (entry->second.paceLimit > 0
+            && ((mount && fuseMountType(mount->type)) || (!mount && isFuseStatfs(directory)))) {
+          entry->second.rangeSyncUnsupported = true;
+        }
       }
       it = entry;
     }

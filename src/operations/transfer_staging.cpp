@@ -316,7 +316,7 @@ namespace luciole::transfer {
         if (replace || action == TransferAction::Move) {
           work.writeback.pin(*volume, destination);
         }
-        Stage stage(destination, work);
+        Stage stage(destination, work, *binding.location.nativePath());
         work.metadataIncomplete = false;
         bool published = false;
         bool deferred = false;
@@ -327,6 +327,7 @@ namespace luciole::transfer {
               fail("Could not create symbolic link");
             }
           } else {
+            const PacingScope pacing(work, stage, *volume);
             tree = copyTree(source.parent.get(), source.name, stage.fd(), "item", work, 0);
             requireUnchanged(source.metadata, tree->metadata);
           }
@@ -635,7 +636,8 @@ namespace luciole::transfer {
     }
   } // namespace
 
-  Stage::Stage(int parent, CopyWork& work) : m_parent(parent), m_work(work) {
+  Stage::Stage(int parent, CopyWork& work, std::string parentPath)
+      : m_parent(parent), m_work(work), m_parentPath(std::move(parentPath)) {
     const GString id(g_uuid_string_random());
     m_name = ".luciole-transfer-" + std::string(id.get());
     if (::mkdirat(parent, m_name.c_str(), 0700) != 0) {
@@ -653,6 +655,30 @@ namespace luciole::transfer {
     if (!m_cleaned) {
       (void)clear();
     }
+  }
+
+  void Stage::prepareAsyncCleanup() {
+    if (m_ownedParent.valid()) {
+      return;
+    }
+    m_ownedParent = checkedFd(::fcntl(m_parent, F_DUPFD_CLOEXEC, 0));
+    m_identity = statFd(m_fd.get());
+    if (!m_parentPath.empty()) {
+      m_path = m_parentPath == "/" ? "/" + m_name : m_parentPath + "/" + m_name;
+    } else {
+      m_path = m_name;
+    }
+  }
+
+  DetachedStage Stage::detachForCleanup() noexcept {
+    m_cleaned = true;
+    return DetachedStage{
+        .parent = std::move(m_ownedParent),
+        .directory = std::move(m_fd),
+        .name = std::move(m_name),
+        .identity = m_identity,
+        .path = std::move(m_path),
+    };
   }
 
   void Stage::flushReplacement(Writeback& writeback, Writeback::Volume& volume) {
@@ -677,9 +703,26 @@ namespace luciole::transfer {
       for (const auto& name : names) {
         removeTemporary(m_fd.get(), name, m_work);
       }
+      m_fd = Fd{};
       return ::unlinkat(m_parent, m_name.c_str(), AT_REMOVEDIR) == 0;
     } catch (...) {
       return false;
+    }
+  }
+
+  PacingScope::PacingScope(Work& work, Stage& stage, Writeback::Volume& volume)
+      : m_work(work), m_stage(stage), m_previousPaceLimit(std::exchange(work.paceLimit, volume.paceLimit)),
+        m_previousRangeSyncUnsupported(std::exchange(work.rangeSyncUnsupported, &volume.rangeSyncUnsupported)),
+        m_previousOps(std::exchange(work.writebackOps, &work.writeback.ops)),
+        m_previousPrepare(std::exchange(work.prepareAsyncStage, [&stage] { stage.prepareAsyncCleanup(); })) {}
+
+  PacingScope::~PacingScope() {
+    m_work.paceLimit = m_previousPaceLimit;
+    m_work.rangeSyncUnsupported = m_previousRangeSyncUnsupported;
+    m_work.writebackOps = m_previousOps;
+    m_work.prepareAsyncStage = std::move(m_previousPrepare);
+    if (auto pending = std::exchange(m_work.abandonedCleanup, {})) {
+      pending->attachStage(m_stage.detachForCleanup());
     }
   }
 
