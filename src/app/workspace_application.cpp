@@ -1938,7 +1938,7 @@ void WorkspaceApplication::rebuildStrip(Host& host, const luciole::TabWindow& wi
       {.out = &host.strip,
        .align = FlexAlign::Center,
        .gap = Style::spaceXs,
-       .paddingH = Style::spaceSm,
+       .paddingH = kWorkspaceInset,
        .height = kTabStripHeight,
        .participatesInLayout = false},
       std::move(scroll),
