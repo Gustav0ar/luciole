@@ -16,14 +16,13 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <glib.h>
 #include <map>
 #include <memory>
 #include <optional>
 #include <ranges>
 #include <string_view>
 #include <variant>
-
-struct _GSource;
 
 // In variant order of OperationJob::Service.
 enum class JobKind : std::uint8_t {
@@ -207,7 +206,7 @@ private:
   std::deque<luciole::JobActivity> m_finishedActivities;
   std::size_t m_historyProbes = 0;
   std::size_t m_historyRetirements = 0;
-  _GSource* m_shutdownTimer = nullptr;
+  GSource* m_shutdownTimer = nullptr;
   bool m_shutdownTimedOut = false;
   std::shared_ptr<int> m_lifetime = std::make_shared<int>(0);
 };
