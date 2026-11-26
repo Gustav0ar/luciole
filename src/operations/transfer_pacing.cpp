@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <print>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <utility>
 
@@ -29,32 +30,14 @@ namespace luciole::transfer {
       bool valid = false;
     };
 
-    MountTag mountTagForFd(int fd) noexcept {
-      if (fd < 0) {
-        return {};
-      }
-      struct stat st{};
-      if (::fstat(fd, &st) != 0) {
-        return {};
-      }
-      MountTag tag{.device = st.st_dev, .mountId = std::nullopt, .valid = true};
+    // Asks only for the mount id: requesting mtime makes NFS flush dirty pages, stalling exactly when cancelling.
+    MountTag mountTag(int directory, const char* path, int flags) noexcept {
       struct statx stx{};
-      if (::statx(fd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_MNT_ID, &stx) == 0
-          && (stx.stx_mask & STATX_MNT_ID)) {
-        tag.mountId = stx.stx_mnt_id;
-      }
-      return tag;
-    }
-
-    MountTag mountTagForPath(const std::string& path) noexcept {
-      struct stat st{};
-      if (::stat(path.c_str(), &st) != 0) {
+      if (::statx(directory, path, flags | AT_STATX_DONT_SYNC, STATX_MNT_ID, &stx) != 0) {
         return {};
       }
-      MountTag tag{.device = st.st_dev, .mountId = std::nullopt, .valid = true};
-      struct statx stx{};
-      if (::statx(AT_FDCWD, path.c_str(), AT_STATX_DONT_SYNC, STATX_MNT_ID, &stx) == 0
-          && (stx.stx_mask & STATX_MNT_ID)) {
+      MountTag tag{.device = makedev(stx.stx_dev_major, stx.stx_dev_minor), .mountId = std::nullopt, .valid = true};
+      if (stx.stx_mask & STATX_MNT_ID) {
         tag.mountId = stx.stx_mnt_id;
       }
       return tag;
@@ -628,7 +611,7 @@ namespace luciole::transfer {
   }
 
   void PacedWriter::abandonLocked() noexcept {
-    const auto tag = mountTagForFd(m_output.get());
+    const auto tag = mountTag(m_output.get(), "", AT_EMPTY_PATH);
     m_state->cleanupId = registerCleanup(tag);
     m_state->abandonedOutput = std::move(m_output);
     m_state->abandoned = true;
@@ -651,7 +634,7 @@ namespace luciole::transfer {
     if (!path) {
       return false;
     }
-    const auto rootTag = mountTagForPath(*path);
+    const auto rootTag = mountTag(AT_FDCWD, path->c_str(), 0);
     const std::scoped_lock lock(registry.mutex);
     return std::ranges::any_of(registry.active, [&](const ActiveCleanup& item) {
       return sameMountTag(item.mount, rootTag);
