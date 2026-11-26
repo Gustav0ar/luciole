@@ -310,6 +310,9 @@ namespace luciole::transfer {
       copyData(input.get(), output.get(), work);
       requireUnchanged(source, statFd(input.get()));
       preserveMetadata(input.get(), output.get(), source, work);
+      if (output.close() != 0) {
+        fail("Could not close copied file");
+      }
     } else if (S_ISDIR(source.st_mode)) {
       auto input = directory(from, name);
       requireUnchanged(source, statFd(input.get()));

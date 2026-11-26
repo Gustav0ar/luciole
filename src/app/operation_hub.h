@@ -127,9 +127,9 @@ public:
 
   // A new idle job owned by `page`; start its service right away. The hub drops the job once it is idle and only
   // the hub holds it.
-  template <typename Service>
-  std::shared_ptr<OperationJob> create(luciole::TabId page, JobScope scope = JobScope::Follow) {
-    return add(page, std::make_unique<Service>(), scope);
+  template <typename Service, typename... Args>
+  std::shared_ptr<OperationJob> create(luciole::TabId page, JobScope scope = JobScope::Follow, Args&&... args) {
+    return add(page, std::make_unique<Service>(std::forward<Args>(args)...), scope);
   }
   // Lets a page-scoped job move with its window from now on, as a job that applies changes does.
   void follow(const OperationJob& job) { m_routing.follow(job.id()); }

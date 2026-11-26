@@ -6,6 +6,8 @@ Copy, move, create and rename files, and watch running jobs in the File Operatio
 
 Select items, press `Ctrl+C` to copy or `Ctrl+X` to cut, open the destination folder and press `Ctrl+V`. Paste is also in the context menus, including List view. Clipboard transfers and drag and drop work between Luciole windows and with other applications.
 
+When copying to removable storage, File Operations shows **Writing to device…** while the filesystem finishes writing. Wait for completion before ejecting the drive. If the flush fails after a file appears in the destination, the report marks the transfer partial and lists any retained replacement.
+
 To copy paths as text, use **Copy Location**: **Path** (`Ctrl+Alt+C`) or **URI** (`Ctrl+Alt+U`). Several items are separated by newlines. To change these shortcuts, see [keybinds](keybinds.md).
 
 ## Paste an image

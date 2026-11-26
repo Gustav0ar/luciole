@@ -69,7 +69,9 @@ bool OperationJob::cancellable() const {
   case JobKind::BatchRename:
     return service<luciole::BatchRenameService>().applying();
   case JobKind::Transfer:
+    return running() && service<luciole::TransferService>().flushPhase() != luciole::TransferFlush::Final;
   case JobKind::Archive:
+    return running() && service<luciole::ArchiveService>().flushPhase() != luciole::TransferFlush::Final;
   case JobKind::Trash:
   case JobKind::Restore:
   case JobKind::EmptyTrash:
@@ -392,6 +394,8 @@ void OperationHub::shutdown() {
     (void)id;
     if (job->kind() == JobKind::Archive) {
       job->service<luciole::ArchiveService>().shutdown();
+    } else if (job->kind() == JobKind::Transfer) {
+      job->service<luciole::TransferService>().shutdown();
     } else {
       job->cancel();
     }

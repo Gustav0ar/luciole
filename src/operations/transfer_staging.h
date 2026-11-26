@@ -6,6 +6,7 @@
 #include "operations/operation_history.h"
 #include "operations/transfer_copy.h"
 #include "operations/transfer_service.h"
+#include "operations/transfer_writeback.h"
 
 #include <cstddef>
 #include <functional>
@@ -45,7 +46,7 @@ namespace luciole::transfer {
   struct PendingMove {
     Node* node;
     Tree tree;
-    Fd destination;
+    Writeback::Volume* destination;
     // The node's outcome once its source is removed.
     TransferOutcome outcome = TransferOutcome::Moved;
     std::shared_ptr<const CopiedMoveEffect> proof;
@@ -62,6 +63,7 @@ namespace luciole::transfer {
     Work(CancelToken cancel, std::atomic<std::uint64_t>& copied, Choose ask)
         : CopyWork(std::move(cancel), copied), choose(std::move(ask)) {}
     Choose choose;
+    Writeback writeback;
     // Optional successful same-filesystem rename capture. False stops further optional capture.
     std::function<bool(const Source&, const Location&, int, int)> recordMove;
     std::function<std::shared_ptr<const MoveEffect>(const Source&, const Location&, int)> prepareMove;
@@ -104,6 +106,8 @@ namespace luciole::transfer {
     Stage(const Stage&) = delete;
     Stage& operator=(const Stage&) = delete;
     bool clear() noexcept;
+    // A failed post-exchange flush leaves the displaced file in this stage.
+    void flushReplacement(Writeback& writeback, Writeback::Volume& volume);
     int fd() const { return m_fd.get(); }
     const std::string& name() const { return m_name; }
     void retain() { m_cleaned = true; }
@@ -125,5 +129,5 @@ namespace luciole::transfer {
   // Every job flushes before it reports outcomes.
   void flushMoves(Work& work);
   std::size_t retryCount(const Node& node);
-  TransferResult snapshot(const Node& node);
+  TransferResult snapshot(Node& node);
 } // namespace luciole::transfer

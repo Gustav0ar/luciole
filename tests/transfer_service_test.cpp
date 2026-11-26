@@ -1,5 +1,6 @@
 #include "event_loop/glib_poll_source.h"
 #include "fs/posix_fd.h"
+#include "fs/system_mounts.h"
 #include "operations/copy_receipt.h"
 #include "operations/creation_stage.h"
 #include "operations/history_revisions.h"
@@ -15,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <linux/fs.h>
+#include <linux/mman.h>
 #include <print>
 #include <sched.h>
 #include <stdexcept>
@@ -22,6 +24,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <thread>
 #include <unistd.h>
@@ -121,6 +125,429 @@ namespace {
   private:
     GlibPollSource m_source;
   };
+  void testWriteback(Pump& pump) {
+    Fixture fixture;
+    const auto group = fixture.source("tree"), merged = fixture.destination("tree");
+    fs::create_directory(group);
+    fs::create_directory(merged);
+    write(group / "leaf", "incoming");
+    unsigned calls = 0;
+    int pinned = -1;
+    struct stat pinnedStat{};
+    luciole::TransferService failing(
+        {.removable = [](int, dev_t) { return true; },
+         .sync =
+             [&](int fd) {
+               ++calls;
+               pinned = fd;
+               pinnedStat = luciole::statFd(fd);
+               luciole::throwErrno(EIO);
+             }}
+    );
+    pump.run(failing, {location(group)}, fixture.destination(""), TransferAction::Copy, [](const auto&) {
+      return TransferConflictChoice::Merge;
+    });
+    const auto& parent = failing.results().front();
+    TEST_CHECK(parent.outcome == TransferOutcome::Partial && parent.error);
+    TEST_CHECK(parent.children.size() == 1 && parent.children.front().outcome == TransferOutcome::Partial);
+    TEST_CHECK(parent.children.front().destination == location(merged / "leaf"));
+    TEST_CHECK(!failing.copyReceipt() && !failing.retryFailed() && calls == 1);
+    struct stat afterPinned{};
+    TEST_CHECK(::fstat(pinned, &afterPinned) != 0 ? errno == EBADF : !luciole::sameIdentity(pinnedStat, afterPinned));
+
+    write(fixture.source("overwrite"), "new");
+    write(fixture.destination("overwrite"), "old");
+    write(fixture.source("independent"), "retry this");
+    bool injected = false;
+    luciole::TransferService replacing(
+        {.removable = [](int, dev_t) { return true; },
+         .sync =
+             [&](int) {
+               // The first flush covers the staged file; the second covers the visible name.
+               if (!injected && read(fixture.destination("overwrite")) == "new") {
+                 injected = true;
+                 luciole::throwErrno(ENOSPC);
+               }
+             }}
+    );
+    pump.run(
+        replacing, {location(fixture.source("overwrite")), location(fixture.source("independent"))},
+        fixture.destination(""), TransferAction::Copy, [](const auto&) { return TransferConflictChoice::Replace; }
+    );
+    TEST_CHECK(replacing.results().front().outcome == TransferOutcome::Partial && replacing.retryable() == 1);
+    bool recovered = false;
+    for (const auto& item : fs::directory_iterator(fixture.destination(""))) {
+      if (item.path().filename().native().starts_with(".luciole-transfer-")) {
+        recovered = read(item.path() / "item") == "old"
+            && replacing.results().front().error->message.contains(item.path().filename().native());
+      }
+    }
+    TEST_CHECK(recovered && !replacing.copyReceipt());
+    TEST_CHECK(!fs::exists(fixture.destination("independent")));
+    write(fixture.destination("overwrite"), "kept after failure");
+    TEST_CHECK(replacing.retryFailed());
+    pump.until([&] {
+      TEST_CHECK(!replacing.conflict());
+      return !replacing.busy();
+    });
+    TEST_CHECK(replacing.results().front().outcome == TransferOutcome::Partial);
+    TEST_CHECK(read(fixture.destination("overwrite")) == "kept after failure");
+    TEST_CHECK(replacing.results().back().outcome == TransferOutcome::Copied);
+    TEST_CHECK(read(fixture.destination("independent")) == "retry this");
+
+    unsigned flushes = 0;
+    luciole::TransferService cancelled(
+        {.removable = [](int, dev_t) { return true; },
+         .sync =
+             [&](int fd) {
+               ++flushes;
+               luciole::transfer::synchronize(fd);
+             }}
+    );
+    write(fixture.source("first"), "already published");
+    pump.run(
+        cancelled, {location(fixture.source("first")), location(fixture.source("overwrite"))}, fixture.destination(""),
+        TransferAction::Copy, [](const auto&) { return TransferConflictChoice::Cancel; }
+    );
+    TEST_CHECK(flushes == 1 && read(fixture.destination("first")) == "already published");
+    TEST_CHECK(
+        cancelled.results()[0].outcome == TransferOutcome::Copied
+        && cancelled.results()[1].outcome == TransferOutcome::Cancelled
+    );
+
+    luciole::TransferService fixed(
+        {.removable = [](int, dev_t) { return false; }, .sync = [](int) { TEST_CHECK(false); }}
+    );
+    write(fixture.source("ordinary"), "data");
+    pump.run(fixed, {location(fixture.source("ordinary"))}, fixture.destination(""), TransferAction::Copy);
+    TEST_CHECK(fixed.results().front().outcome == TransferOutcome::Copied);
+
+    // Fixed-disk replacing copies pay only the pre-exchange flush (1 sync per item, no post-exchange flush).
+    {
+      Fixture f;
+      write(f.source("r1"), "new1");
+      write(f.source("r2"), "new2");
+      write(f.destination("r1"), "old1");
+      write(f.destination("r2"), "old2");
+      unsigned syncs = 0;
+      luciole::TransferService fixedReplace(
+          {.removable = [](int, dev_t) { return false; }, .sync = [&](int) { ++syncs; }}
+      );
+      pump.run(
+          fixedReplace, {location(f.source("r1")), location(f.source("r2"))}, f.destination(""), TransferAction::Copy,
+          [](const auto&) { return TransferConflictChoice::Replace; }
+      );
+      TEST_CHECK(syncs == 2 && fixedReplace.results()[0].outcome == TransferOutcome::Copied);
+      TEST_CHECK(fixedReplace.results()[1].outcome == TransferOutcome::Copied);
+      pump.cleanup(fixedReplace);
+    }
+
+    // Same-filesystem Move+Replace of two items on removable media with history batches into one terminal flush.
+    {
+      Fixture f;
+      write(f.source("m1"), "new1");
+      write(f.source("m2"), "new2");
+      write(f.destination("m1"), "old1");
+      write(f.destination("m2"), "old2");
+      unsigned syncs = 0;
+      luciole::TransferService exchangeMove(
+          {.removable = [](int, dev_t) { return true; }, .sync = [&](int) { ++syncs; }}
+      );
+      pump.run(
+          exchangeMove, {location(f.source("m1")), location(f.source("m2"))}, f.destination(""), TransferAction::Move,
+          [](const auto&) { return TransferConflictChoice::Replace; }
+      );
+      TEST_CHECK(syncs == 1 && exchangeMove.receipt());
+      TEST_CHECK(
+          exchangeMove.results()[0].outcome == TransferOutcome::Moved
+          && exchangeMove.results()[1].outcome == TransferOutcome::Moved
+      );
+    }
+
+    // Failing that terminal flush marks exchanged moves Partial without arming history and retains displaced data.
+    {
+      Fixture f;
+      write(f.source("m1"), "new1");
+      write(f.destination("m1"), "old1");
+      unsigned syncs = 0;
+      luciole::TransferService failingExchange(
+          {.removable = [](int, dev_t) { return true; },
+           .sync =
+               [&](int) {
+                 ++syncs;
+                 luciole::throwErrno(EIO);
+               }}
+      );
+      pump.run(failingExchange, {location(f.source("m1"))}, f.destination(""), TransferAction::Move, [](const auto&) {
+        return TransferConflictChoice::Replace;
+      });
+      TEST_CHECK(syncs == 1 && !failingExchange.receipt() && !failingExchange.retryable());
+      TEST_CHECK(
+          failingExchange.results()[0].outcome == TransferOutcome::Partial && failingExchange.results()[0].error
+      );
+      TEST_CHECK(failingExchange.results()[0].error->message.contains("Retained item for inspection"));
+    }
+
+    // Deferred writeback failure updates parent error on already-Partial Copy merges (skipped and cancelled siblings).
+    for (const auto choice : {TransferConflictChoice::Skip, TransferConflictChoice::Cancel}) {
+      Fixture f;
+      fs::create_directory(f.source("tree"));
+      fs::create_directory(f.destination("tree"));
+      write(f.source("tree/a"), "copied");
+      write(f.source("tree/b"), "conflict");
+      write(f.destination("tree/b"), "existing");
+      luciole::TransferService partialMerge(
+          {.removable = [](int, dev_t) { return true; }, .sync = [](int) { luciole::throwErrno(EIO); }}
+      );
+      pump.run(partialMerge, {location(f.source("tree"))}, f.destination(""), TransferAction::Copy, [&](const auto& c) {
+        return c.canMerge ? TransferConflictChoice::Merge : choice;
+      });
+      const auto& root = partialMerge.results().front();
+      TEST_CHECK(root.outcome == TransferOutcome::Partial && root.error);
+      TEST_CHECK(root.children[0].outcome == TransferOutcome::Partial && root.children[0].error);
+      TEST_CHECK(root.error->message.contains(root.children[0].error->message));
+      TEST_CHECK(root.error->kind != luciole::FileErrorKind::Cancelled);
+    }
+
+    // Writeback::finish() clears TransferFlush::Final back to TransferFlush::None before returning.
+    {
+      Fixture f;
+      auto dir = luciole::checkedFd(::open(f.destination("").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+      luciole::transfer::Writeback wb;
+      std::vector<luciole::TransferFlush> transitions;
+      wb.ops.removable = [](int, dev_t) { return true; };
+      wb.ops.sync = [](int) {};
+      wb.phase = [&](luciole::TransferFlush p) { transitions.push_back(p); };
+      auto& vol = wb.observe(dir.get(), luciole::statFd(dir.get()).st_dev);
+      luciole::TransferResult r{location(f.source("x")), TransferOutcome::Copied};
+      wb.published(vol, r);
+      TEST_CHECK(!wb.finish());
+      TEST_CHECK(
+          transitions.size() == 2
+          && transitions[0] == luciole::TransferFlush::Final
+          && transitions[1] == luciole::TransferFlush::None
+      );
+    }
+
+    // A retry failure in openTransferMounts() preserves errors on nested terminal Partial sub-merges.
+    {
+      Fixture f;
+      fs::create_directories(f.source("tree/a_partial"));
+      fs::create_directories(f.destination("tree/a_partial"));
+      fs::create_directories(f.source("tree/b_retry"));
+      fs::create_directories(f.destination("tree/b_retry"));
+      write(f.source("tree/a_partial/leaf"), "new");
+      write(f.destination("tree/a_partial/leaf"), "old");
+      write(f.source("tree/b_retry/leaf"), "retry");
+      unsigned syncs = 0;
+      luciole::TransferService mixed(
+          {.removable = [](int, dev_t) { return true; },
+           .sync =
+               [&](int) {
+                 if (++syncs == 2) {
+                   luciole::throwErrno(ENOSPC);
+                 }
+               }}
+      );
+      pump.run(mixed, {location(f.source("tree"))}, f.destination(""), TransferAction::Copy, [](const auto& conflict) {
+        return conflict.canMerge ? TransferConflictChoice::Merge : TransferConflictChoice::Replace;
+      });
+      TEST_CHECK(mixed.retryable() == 1);
+      const auto& subPartialBefore = mixed.results()[0].children[0];
+      TEST_CHECK(subPartialBefore.outcome == TransferOutcome::Partial && subPartialBefore.error);
+      TEST_CHECK(
+          subPartialBefore.children[0].outcome == TransferOutcome::Partial && !subPartialBefore.children[0].retryable
+      );
+      const auto preserved = subPartialBefore.error->message;
+
+      const auto savedMounts = luciole::knownNativeMounts();
+      luciole::publishNativeMounts(
+          {{.path = f.destination("").native(),
+            .source = "server:/export",
+            .type = "nfs4",
+            .options = "x-systemd.automount",
+            .automount = true}}
+      );
+      TEST_CHECK(mixed.retryFailed());
+      pump.until([&] { return !mixed.busy(); });
+      luciole::publishNativeMounts(savedMounts);
+
+      const auto& subPartialAfter = mixed.results()[0].children[0];
+      const auto& subRetryAfter = mixed.results()[0].children[1];
+      TEST_CHECK(subPartialAfter.outcome == TransferOutcome::Partial && subPartialAfter.error);
+      TEST_CHECK(subPartialAfter.error->message == preserved);
+      TEST_CHECK(subRetryAfter.children[0].outcome == TransferOutcome::Failed);
+    }
+
+    // A failure on the post-cleanup final flush after a removable replacement is reported instead of swallowed.
+    {
+      Fixture f;
+      write(f.source("rep"), "new");
+      write(f.destination("rep"), "old");
+      unsigned syncs = 0;
+      luciole::TransferService cleanupFail(
+          {.removable = [](int, dev_t) { return true; },
+           .sync =
+               [&](int) {
+                 if (++syncs == 3) {
+                   luciole::throwErrno(EIO);
+                 }
+               }}
+      );
+      pump.run(cleanupFail, {location(f.source("rep"))}, f.destination(""), TransferAction::Copy, [](const auto&) {
+        return TransferConflictChoice::Replace;
+      });
+      TEST_CHECK(syncs == 3 && cleanupFail.results()[0].outcome == TransferOutcome::Partial);
+      TEST_CHECK(cleanupFail.results()[0].error && !cleanupFail.copyReceipt() && !cleanupFail.retryable());
+    }
+
+    // OperationHistory mode also suppresses Undo capture when the final removable writeback fails.
+    {
+      Fixture f;
+      write(f.source("hist"), "data");
+      luciole::TransferService opHist(
+          {.removable = [](int, dev_t) { return true; }, .sync = [](int) { luciole::throwErrno(EIO); }}
+      );
+      opHist.useOperationHistory();
+      pump.run(opHist, {location(f.source("hist"))}, f.destination(""), TransferAction::Copy);
+      TEST_CHECK(opHist.results()[0].outcome == TransferOutcome::Partial && opHist.results()[0].error);
+      TEST_CHECK(!opHist.copyReceipt() && !opHist.receipt() && !opHist.retryable());
+    }
+
+    // Real default syncfs() path leaves zero dirty or writeback pages on disk at completion.
+    {
+      const std::string diskParent = ::access("/var/tmp", W_OK) == 0 ? "/var/tmp" : fixtureParent;
+      Fixture src;
+      Fixture dst(diskParent);
+      const std::string payload(2 * 1024 * 1024, 'Z');
+      write(src.source("flush.bin"), payload);
+      luciole::TransferService realSync({.removable = [](int, dev_t) { return true; }});
+      pump.run(realSync, {location(src.source("flush.bin"))}, dst.destination(""), TransferAction::Copy);
+      TEST_CHECK(realSync.results()[0].outcome == TransferOutcome::Copied && !realSync.results()[0].error);
+      const auto output = dst.destination("flush.bin");
+      TEST_CHECK(fs::file_size(output) == payload.size());
+#ifdef SYS_cachestat
+      const auto fd = luciole::checkedFd(::open(output.c_str(), O_RDONLY | O_CLOEXEC));
+      struct cachestat_range range{0, 0};
+      struct cachestat stats{};
+      if (::syscall(SYS_cachestat, fd.get(), &range, &stats, 0) == 0) {
+        TEST_CHECK(stats.nr_dirty == 0 && stats.nr_writeback == 0);
+      } else {
+        TEST_CHECK(errno == ENOSYS || errno == EPERM);
+      }
+#endif
+    }
+    drainHistoryCleanup();
+    (void)luciole::CopyReceipt::takeCleanupErrors();
+  }
+
+  void testRemovableDevices() {
+    Fixture fixture;
+    constexpr std::string_view mounts = "41 1 0:37 /@ /media/usb rw - btrfs /dev/sdb1 rw\n"
+                                        "42 1 0:37 /@home /media/home rw - btrfs /dev/sdb1 rw\n"
+                                        "43 1 0:70 / /media/t rw - fuseblk /dev/mapper/portable\\040disk rw\n"
+                                        "44 1 0:71 / /mnt/n rw - nfs4 server:/export rw\n"
+                                        "45 1 0:72 / /mnt/s rw - smb3 //server/share rw\n";
+    bool found = false;
+    const auto usb = luciole::transfer::blockMount(mounts, 41, &found);
+    TEST_CHECK(found);
+    const auto subvolume = luciole::transfer::blockMount(mounts, 42, &found);
+    TEST_CHECK(found && usb && subvolume && usb->source == "/dev/sdb1" && usb->filesystem == subvolume->filesystem);
+    TEST_CHECK(luciole::transfer::blockMount(mounts, 43)->source == "/dev/mapper/portable disk");
+    TEST_CHECK(!luciole::transfer::blockMount(mounts, 44, &found) && found);
+    TEST_CHECK(!luciole::transfer::blockMount(mounts, 45, &found) && found);
+    TEST_CHECK(!luciole::transfer::blockMount(mounts, 999, &found) && !found);
+
+    // Put a decoy removable file above devices/ to verify the ancestor walk stops at devices/.
+    write(fixture.root / "removable", "1");
+    const auto busUsb = fixture.root / "bus/usb", busPci = fixture.root / "bus/pci";
+    fs::create_directories(busUsb);
+    fs::create_directories(busPci);
+    const auto devices = fixture.root / "devices";
+    auto rootHub = devices / "pci0000:00/usb8";
+    auto usbPort = rootHub / "8-1";
+    auto ssd = usbPort / "block/sda";
+    fs::create_directories(ssd / "sda1");
+    fs::create_directory_symlink(busUsb, rootHub / "subsystem");
+    write(rootHub / "removable", "unknown");
+    write(rootHub / "devnum", "1");
+    fs::create_directory_symlink(busUsb, usbPort / "subsystem");
+    write(usbPort / "devnum", "2");
+    write(ssd / "removable", "0");
+    write(ssd / "sda1/partition", "1");
+    write(usbPort / "removable", "removable");
+    auto dm = devices / "virtual/block/dm-0";
+    fs::create_directories(dm / "slaves");
+    fs::create_directory_symlink(ssd / "sda1", dm / "slaves/sda1");
+    TEST_CHECK(luciole::transfer::removableBlockDevice(dm));
+    // Fixed-flag USB storage on a port without ACPI metadata reports "unknown"; non-root USB must classify removable.
+    write(usbPort / "removable", "unknown");
+    TEST_CHECK(luciole::transfer::removableBlockDevice(dm));
+    // Explicit "fixed" USB device under an "unknown" root hub (devnum=1) must stay non-removable.
+    write(usbPort / "removable", "fixed");
+    TEST_CHECK(!luciole::transfer::removableBlockDevice(dm));
+    // A "fixed" device behind a removable external USB hub stays removable.
+    auto hubChild = usbPort / "8-1.1/block/sdb";
+    fs::create_directories(hubChild);
+    fs::create_directory_symlink(busUsb, usbPort / "8-1.1/subsystem");
+    write(usbPort / "8-1.1/devnum", "3");
+    write(usbPort / "8-1.1/removable", "fixed");
+    write(hubChild / "removable", "0");
+    write(usbPort / "removable", "removable");
+    TEST_CHECK(luciole::transfer::removableBlockDevice(hubChild));
+    write(usbPort / "removable", "fixed");
+    TEST_CHECK(!luciole::transfer::removableBlockDevice(hubChild));
+    write(ssd / "removable", "1");
+    TEST_CHECK(luciole::transfer::removableBlockDevice(dm));
+
+    // External PCIe/Thunderbolt port reports removable="removable"; PCI "unknown" stays non-removable.
+    auto pcie = devices / "pci0000:00/0000:01:00.0/nvme/nvme0/nvme0n1";
+    fs::create_directories(pcie);
+    fs::create_directory_symlink(busPci, devices / "pci0000:00/0000:01:00.0/subsystem");
+    write(pcie / "removable", "0");
+    write(devices / "pci0000:00/0000:01:00.0/removable", "unknown");
+    TEST_CHECK(!luciole::transfer::removableBlockDevice(pcie));
+    write(devices / "pci0000:00/0000:01:00.0/removable", "removable");
+    TEST_CHECK(luciole::transfer::removableBlockDevice(pcie));
+
+    const auto mmc = devices / "mmc/card/block/mmcblk0";
+    fs::create_directories(mmc);
+    write(devices / "mmc/card/type", "MMC");
+    TEST_CHECK(!luciole::transfer::removableBlockDevice(mmc));
+    write(devices / "mmc/card/type", "SD");
+    TEST_CHECK(luciole::transfer::removableBlockDevice(mmc));
+    write(devices / "mmc/card/type", "SDcombo");
+    TEST_CHECK(luciole::transfer::removableBlockDevice(mmc));
+
+    // Cached /proc/self/mountinfo snapshot refreshes when a newly mounted stx_mnt_id appears mid-job.
+    auto fdA = luciole::checkedFd(::open(fixture.root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    auto fdB = luciole::checkedFd(::open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    struct statx stxA{}, stxB{};
+    if (::statx(fdA.get(), "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_MNT_ID, &stxA) == 0
+        && (stxA.stx_mask & STATX_MNT_ID)
+        && ::statx(fdB.get(), "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_MNT_ID, &stxB) == 0
+        && (stxB.stx_mask & STATX_MNT_ID)
+        && stxA.stx_mnt_id != stxB.stx_mnt_id) {
+      unsigned reads = 0;
+      std::string table = std::format("{} 1 0:1001 / /a rw - tmpfs tmpfs rw\n", stxA.stx_mnt_id);
+      luciole::transfer::Writeback wb;
+      wb.ops.mountinfo = [&] {
+        ++reads;
+        return table;
+      };
+      wb.observe(fdA.get(), makedev(0, 1001));
+      TEST_CHECK(reads == 1);
+      // Second lookup on an already-known mount ID reuses the snapshot without re-reading.
+      wb.observe(fdA.get(), makedev(0, 1002));
+      TEST_CHECK(reads == 1);
+      // A newly appearing mount ID triggers one refresh and aliases subvolumes onto its filesystem dev.
+      table += std::format("{} 1 0:2001 / /b rw - btrfs /dev/null rw\n", stxB.stx_mnt_id);
+      auto& firstSub = wb.observe(fdB.get(), makedev(0, 2002));
+      TEST_CHECK(reads == 2);
+      auto& secondSub = wb.observe(fdB.get(), makedev(0, 2003));
+      TEST_CHECK(reads == 2 && &firstSub == &secondSub);
+    }
+  }
   void testCopyHistory(Pump& pump) {
     for (const auto action : {TransferAction::Copy, TransferAction::Link}) {
       Fixture f;
@@ -4537,17 +4964,197 @@ namespace {
     receipt.reset();
     noPrivateMoves(f.storage);
   }
-  int mountedHistoryChecks() {
-    // Always create a private mount namespace before changing propagation or making any bind mount.
-    if (::unshare(CLONE_NEWNS) != 0) {
-      std::println(
-          "Bind-mount history checks unavailable: cannot create a private mount namespace ({})",
-          luciole::errnoError(errno).message
-      );
-      return 77;
+  void testWritebackAcrossMounts(Pump& pump) {
+    Fixture fixture;
+    const auto tree = fixture.source("tree"), target = fixture.destination("tree");
+    for (const auto* branch : {"a", "b"}) {
+      fs::create_directories(tree / branch);
+      fs::create_directories(target / branch);
+      write(tree / branch / "leaf", branch);
+      TEST_CHECK(::mount("tmpfs", (target / branch).c_str(), "tmpfs", 0, "size=4M") == 0);
     }
-    TEST_CHECK(::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0);
+    struct stat failingMount{};
+    TEST_CHECK(::stat((target / "a").c_str(), &failingMount) == 0);
+    unsigned failed = 0, succeeded = 0;
+    luciole::TransferService service(
+        {.removable = [](int, dev_t) { return true; },
+         .sync =
+             [&](int fd) {
+               if (luciole::statFd(fd).st_dev == failingMount.st_dev) {
+                 ++failed;
+                 luciole::throwErrno(EIO);
+               }
+               ++succeeded;
+               luciole::transfer::synchronize(fd);
+             }}
+    );
+    pump.run(service, {location(tree)}, fixture.destination(""), TransferAction::Move, [](const auto&) {
+      return TransferConflictChoice::Merge;
+    });
+    const auto& root = service.results().front();
+    TEST_CHECK(root.outcome == TransferOutcome::Partial && !service.receipt());
+    TEST_CHECK(
+        root.children[0].outcome == TransferOutcome::Partial && root.children[1].outcome == TransferOutcome::Moved
+    );
+    TEST_CHECK(read(tree / "a/leaf") == "a" && !fs::exists(tree / "b"));
+    TEST_CHECK(read(target / "a/leaf") == "a" && read(target / "b/leaf") == "b");
+    TEST_CHECK(failed == 1 && succeeded > 0 && !service.retryable());
+    for (const auto* branch : {"a", "b"}) {
+      TEST_CHECK(::umount((target / branch).c_str()) == 0);
+    }
+
+    // A writeback failure on the parent mount must not block merging into a healthy child mount.
+    {
+      Fixture parentFail;
+      const auto srcTree = parentFail.source("tree"), dstTree = parentFail.destination("tree");
+      fs::create_directories(srcTree / "b");
+      fs::create_directories(dstTree / "b");
+      TEST_CHECK(::mount("tmpfs", dstTree.c_str(), "tmpfs", 0, "size=4M") == 0);
+      fs::create_directory(dstTree / "b");
+      TEST_CHECK(::mount("tmpfs", (dstTree / "b").c_str(), "tmpfs", 0, "size=4M") == 0);
+      write(srcTree / "a_parent", "parent-fail");
+      write(dstTree / "a_parent", "old-parent");
+      write(srcTree / "b/leaf", "healthy-child");
+      struct stat parentMount{};
+      TEST_CHECK(::stat(dstTree.c_str(), &parentMount) == 0);
+      unsigned parentCalls = 0;
+      luciole::TransferService svc(
+          {.removable = [](int, dev_t) { return true; },
+           .sync =
+               [&](int fd) {
+                 if (luciole::statFd(fd).st_dev == parentMount.st_dev && ++parentCalls == 2) {
+                   luciole::throwErrno(EIO);
+                 }
+                 luciole::transfer::synchronize(fd);
+               }}
+      );
+      pump.run(svc, {location(srcTree)}, parentFail.destination(""), TransferAction::Move, [](const auto& conflict) {
+        return conflict.canMerge ? TransferConflictChoice::Merge : TransferConflictChoice::Replace;
+      });
+      const auto& rootResult = svc.results().front();
+      TEST_CHECK(rootResult.outcome == TransferOutcome::Partial);
+      TEST_CHECK(rootResult.children[0].outcome == TransferOutcome::Partial);
+      TEST_CHECK(rootResult.children[1].outcome == TransferOutcome::Moved);
+      TEST_CHECK(read(dstTree / "b/leaf") == "healthy-child" && !fs::exists(srcTree / "b"));
+      TEST_CHECK(::umount((dstTree / "b").c_str()) == 0);
+      TEST_CHECK(::umount(dstTree.c_str()) == 0);
+    }
+
+    // Cross-filesystem fixed-disk Move+Replace batches source-deletion syncs rather than flushing post-exchange per
+    // item.
+    {
+      Fixture cross;
+      TEST_CHECK(::mount("tmpfs", cross.source("").c_str(), "tmpfs", 0, "size=4M") == 0);
+      TEST_CHECK(::mount("tmpfs", cross.destination("").c_str(), "tmpfs", 0, "size=4M") == 0);
+      write(cross.source("f1"), "new1");
+      write(cross.source("f2"), "new2");
+      write(cross.destination("f1"), "old1");
+      write(cross.destination("f2"), "old2");
+      unsigned syncs = 0;
+      luciole::TransferService svc(
+          {.removable = [](int, dev_t) { return false; },
+           .sync =
+               [&](int fd) {
+                 ++syncs;
+                 luciole::transfer::synchronize(fd);
+               }}
+      );
+      pump.run(
+          svc, {location(cross.source("f1")), location(cross.source("f2"))}, cross.destination(""),
+          TransferAction::Move, [](const auto&) { return TransferConflictChoice::Replace; }
+      );
+      // 2 pre-exchange flushes + 1 batched flushMoves() sync before deleting both sources (not 5).
+      TEST_CHECK(syncs == 3);
+      TEST_CHECK(
+          svc.results()[0].outcome == TransferOutcome::Moved && svc.results()[1].outcome == TransferOutcome::Moved
+      );
+      svc.takeReceipt().reset();
+      drainHistoryCleanup();
+      TEST_CHECK(::umount(cross.destination("").c_str()) == 0);
+      TEST_CHECK(::umount(cross.source("").c_str()) == 0);
+    }
+
+    // Mid-job newly mounted filesystem refreshes the cached /proc/self/mountinfo snapshot in a real mount namespace.
+    {
+      Fixture midJob;
+      const auto first = midJob.destination("first"), second = midJob.destination("second");
+      fs::create_directory(first);
+      fs::create_directory(second);
+      TEST_CHECK(::mount("tmpfs", first.c_str(), "tmpfs", 0, "size=4M") == 0);
+      auto fd1 = luciole::checkedFd(::open(first.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+      luciole::transfer::Writeback wb;
+      unsigned reads = 0;
+      wb.ops.mountinfo = [&] {
+        ++reads;
+        std::ifstream mounts("/proc/self/mountinfo");
+        std::ostringstream contents;
+        contents << mounts.rdbuf();
+        return std::move(contents).str();
+      };
+      wb.observe(fd1.get(), luciole::statFd(fd1.get()).st_dev);
+      TEST_CHECK(reads == 1);
+      TEST_CHECK(::mount("tmpfs", second.c_str(), "tmpfs", 0, "size=4M") == 0);
+      auto fd2 = luciole::checkedFd(::open(second.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+      wb.observe(fd2.get(), luciole::statFd(fd2.get()).st_dev);
+      TEST_CHECK(reads == 2);
+      fd2 = {};
+      fd1 = {};
+      TEST_CHECK(::umount(second.c_str()) == 0);
+      TEST_CHECK(::umount(first.c_str()) == 0);
+    }
+  }
+
+  std::size_t threadCount() {
+    std::error_code error;
+    std::size_t count = 0;
+    for (const auto& entry : fs::directory_iterator("/proc/self/task", error)) {
+      (void)entry;
+      ++count;
+    }
+    return count;
+  }
+
+  int mountedChecks(bool writeback, bool inMountNamespace, char** argv) {
+    if (!inMountNamespace) {
+      if (threadCount() > 1) {
+        // GLib/GVfs threads created before main() stay in the old mount namespace after unshare(CLONE_NEWNS).
+        // Isolate a single-threaded forked child into a private mount namespace before re-executing.
+        char* childArgv[] = {argv[0], argv[1], const_cast<char*>("--in-mount-ns"), nullptr};
+        const pid_t pid = ::fork();
+        TEST_CHECK(pid >= 0);
+        if (pid == 0) {
+          if (::unshare(CLONE_NEWNS) != 0) {
+            _exit(errno == EPERM || errno == EACCES || errno == EINVAL ? 77 : 1);
+          }
+          if (::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            _exit(1);
+          }
+          ::execv("/proc/self/exe", childArgv);
+          _exit(127);
+        }
+        int status = 0;
+        TEST_CHECK(::waitpid(pid, &status, 0) == pid);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
+          std::println("Bind-mount history checks unavailable: cannot create a private mount namespace");
+          return 77;
+        }
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+      }
+      // Always create a private mount namespace before changing propagation or making any bind mount.
+      if (::unshare(CLONE_NEWNS) != 0) {
+        std::println(
+            "Bind-mount history checks unavailable: cannot create a private mount namespace ({})",
+            luciole::errnoError(errno).message
+        );
+        return 77;
+      }
+      TEST_CHECK(::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0);
+    }
     Pump pump;
+    if (writeback) {
+      testWritebackAcrossMounts(pump);
+      return 0;
+    }
     testDetachedStagePath();
     testMountedMoveHistory(pump, false);
     testMountedMoveHistory(pump, true);
@@ -4563,8 +5170,9 @@ namespace {
 int main(int argc, char** argv) {
   try {
     luciole::raiseFileDescriptorLimit();
-    if (argc == 2 && std::string_view(argv[1]) == "--mount-history") {
-      return mountedHistoryChecks();
+    if ((argc == 2 || (argc == 3 && std::string_view(argv[2]) == "--in-mount-ns"))
+        && (std::string_view(argv[1]) == "--mount-history" || std::string_view(argv[1]) == "--writeback-mounts")) {
+      return mountedChecks(std::string_view(argv[1]) == "--writeback-mounts", argc == 3, argv);
     }
     Pump pump;
     if (argc == 3 && std::string_view(argv[1]) == "--replacement-filesystem") {
@@ -4588,6 +5196,8 @@ int main(int argc, char** argv) {
     testReplacementSourceGuard(pump);
     testReplacementTimestampGuards(pump);
     testSymbolicLinkDrops(pump);
+    testRemovableDevices();
+    testWriteback(pump);
     testCopyHistory(pump);
     testCopyHistoryGuards(pump);
     testCopyHistoryRetention(pump);

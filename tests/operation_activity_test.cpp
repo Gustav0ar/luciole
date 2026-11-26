@@ -3,6 +3,7 @@
 #include "fs/gio_interop.h"
 #include "fs/posix_fd.h"
 #include "operations/copy_receipt.h"
+#include "operations/transfer_writeback.h"
 #include "operations/trash_item.h"
 #include "test_check.h"
 
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <glib.h>
+#include <semaphore>
 #include <stdexcept>
 #include <string_view>
 #include <unistd.h>
@@ -89,6 +91,127 @@ namespace {
     result.setDisplayName(*location.basename());
     result.setIdentity(luciole::readFileIdentity(info.get()));
     return result;
+  }
+  void removableFlushActivity(Pump& pump) {
+    Fixture fixture;
+    fixture.write("first");
+    fixture.write("second");
+    std::binary_semaphore release(0);
+    unsigned calls = 0;
+    Workspace workspace;
+    luciole::transfer::WritebackOps ops{
+        .removable = [](int, dev_t) { return true; },
+        .sync =
+            [&](int) {
+              ++calls;
+              TEST_CHECK(release.try_acquire_for(std::chrono::seconds(10)));
+            }
+    };
+    auto job = workspace.hub.create<luciole::TransferService>(workspace.page, JobScope::Follow, std::move(ops));
+    auto& service = job->service<luciole::TransferService>();
+    TEST_CHECK(service.start(
+        {{fixture.at("first"), fixture.at("second")}, fixture.at("destination"), luciole::TransferAction::Copy}
+    ));
+    pump.until([&] { return service.flushPhase() == luciole::TransferFlush::Final; });
+    TEST_CHECK(fs::exists(fixture.root / "destination/first") && fs::exists(fixture.root / "destination/second"));
+    const auto activity = workspace.hub.activities().front();
+    TEST_CHECK(service.busy() && activity.state == ActivityState::Working && activity.summary == "Writing to device…");
+    TEST_CHECK(!activity.canCancel && !workspace.hub.cancelActivity(job->id()));
+    // Direct non-shutdown cancel paths (e.g. job->cancel() on page close) must also be no-ops during Final.
+    job->cancel();
+    service.cancel();
+    release.release();
+    pump.until([&] { return !service.busy(); });
+    TEST_CHECK(calls == 1 && service.flushPhase() == luciole::TransferFlush::None);
+    TEST_CHECK(workspace.hub.activities().front().state == ActivityState::Succeeded && workspace.hub.canUndo());
+
+    // Mid-job TransferFlush::Device still shows "Writing to device…" while keeping Cancel enabled.
+    {
+      Fixture devFixture;
+      devFixture.write("incoming");
+      std::ofstream(devFixture.root / "destination/incoming") << "old";
+      std::binary_semaphore devRelease(0);
+      Workspace devWorkspace;
+      luciole::transfer::WritebackOps devOps{
+          .removable = [](int, dev_t) { return true; },
+          .sync = [&](int) { TEST_CHECK(devRelease.try_acquire_for(std::chrono::seconds(10))); }
+      };
+      auto devJob =
+          devWorkspace.hub.create<luciole::TransferService>(devWorkspace.page, JobScope::Follow, std::move(devOps));
+      auto& devService = devJob->service<luciole::TransferService>();
+      TEST_CHECK(
+          devService.start({{devFixture.at("incoming")}, devFixture.at("destination"), luciole::TransferAction::Copy})
+      );
+      pump.until([&] { return devService.conflict().has_value(); });
+      TEST_CHECK(devService.resolve(devService.conflict()->id, luciole::TransferConflictChoice::Replace));
+      pump.until([&] { return devService.flushPhase() == luciole::TransferFlush::Device; });
+      const auto devActivity = devWorkspace.hub.activities().front();
+      TEST_CHECK(devActivity.state == ActivityState::Working && devActivity.summary == "Writing to device…");
+      TEST_CHECK(devActivity.canCancel && devWorkspace.hub.cancelActivity(devJob->id()));
+      devRelease.release();
+      pump.until([&] { return !devService.busy(); });
+      TEST_CHECK(devService.results().front().outcome == luciole::TransferOutcome::Cancelled);
+      TEST_CHECK(devService.flushPhase() == luciole::TransferFlush::None);
+    }
+
+    // OperationHub::shutdown() cancels even during TransferFlush::Final so post-flush history capture aborts.
+    {
+      Fixture shutFixture;
+      shutFixture.write("item");
+      std::binary_semaphore shutRelease(0);
+      Workspace shutWorkspace;
+      luciole::transfer::WritebackOps shutOps{
+          .removable = [](int, dev_t) { return true; },
+          .sync = [&](int) { TEST_CHECK(shutRelease.try_acquire_for(std::chrono::seconds(10))); }
+      };
+      auto shutJob =
+          shutWorkspace.hub.create<luciole::TransferService>(shutWorkspace.page, JobScope::Follow, std::move(shutOps));
+      auto& shutService = shutJob->service<luciole::TransferService>();
+      TEST_CHECK(
+          shutService.start({{shutFixture.at("item")}, shutFixture.at("destination"), luciole::TransferAction::Copy})
+      );
+      pump.until([&] { return shutService.flushPhase() == luciole::TransferFlush::Final; });
+      TEST_CHECK(!shutWorkspace.hub.cancelActivity(shutJob->id()));
+      shutWorkspace.hub.shutdown();
+      shutRelease.release();
+      pump.until([&] { return !shutService.busy(); });
+      TEST_CHECK(shutService.flushPhase() == luciole::TransferFlush::None);
+      TEST_CHECK(!shutService.copyReceipt() && !shutWorkspace.hub.canUndo());
+    }
+
+    // ArchiveService publication onto removable media exposes "Writing to device…" and disables Cancel in Final.
+    {
+      Fixture archFixture;
+      archFixture.write("input");
+      std::binary_semaphore archRelease(0);
+      unsigned archCalls = 0;
+      Workspace archWorkspace;
+      luciole::transfer::WritebackOps archOps{
+          .removable = [](int, dev_t) { return true; },
+          .sync =
+              [&](int) {
+                ++archCalls;
+                TEST_CHECK(archRelease.try_acquire_for(std::chrono::seconds(10)));
+              }
+      };
+      auto archJob =
+          archWorkspace.hub.create<luciole::ArchiveService>(archWorkspace.page, JobScope::Follow, std::move(archOps));
+      auto& archive = archJob->service<luciole::ArchiveService>();
+      TEST_CHECK(archive.compress(
+          {archFixture.at("input")}, archFixture.at("destination/out.zip"), luciole::ArchiveFormat::Zip
+      ));
+      pump.until([&] { return archive.flushPhase() == luciole::TransferFlush::Final; });
+      const auto archActivity = archWorkspace.hub.activities().front();
+      TEST_CHECK(archActivity.state == ActivityState::Working);
+      TEST_CHECK(archActivity.summary.starts_with("Writing to device…"));
+      TEST_CHECK(!archActivity.canCancel && !archWorkspace.hub.cancelActivity(archJob->id()));
+      archJob->cancel();
+      archive.cancel();
+      archRelease.release();
+      pump.until([&] { return !archive.busy(); });
+      TEST_CHECK(archCalls == 1 && archive.flushPhase() == luciole::TransferFlush::None && !archive.error());
+      TEST_CHECK(archWorkspace.hub.activities().front().state == ActivityState::Succeeded);
+    }
   }
   void batchRenameHistory(Pump& pump) {
     Fixture fixture;
@@ -1094,6 +1217,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   TEST_CHECK(argc == 1);
+  removableFlushActivity(pump);
   overwriteHistory(pump);
   trashMoveNotifications(pump, false);
   transferLifecycle(pump);

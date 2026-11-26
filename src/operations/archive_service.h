@@ -70,6 +70,7 @@ namespace luciole {
   class ArchiveService {
   public:
     explicit ArchiveService(ArchiveLimits limits = {});
+    explicit ArchiveService(transfer::WritebackOps ops, ArchiveLimits limits = {});
     ~ArchiveService();
     ArchiveService(const ArchiveService&) = delete;
     ArchiveService& operator=(const ArchiveService&) = delete;
@@ -87,6 +88,7 @@ namespace luciole {
     void shutdown();
     bool busy() const;
     ArchivePhase phase() const;
+    TransferFlush flushPhase() const;
     std::uint64_t bytes() const;
     std::size_t items() const;
     const std::optional<FileError>& error() const;
