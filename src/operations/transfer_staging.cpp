@@ -475,6 +475,22 @@ namespace luciole::transfer {
       return result;
     }
 
+    struct MergeCounts {
+      std::size_t done = 0, failed = 0, skipped = 0, cancelled = 0;
+      void add(TransferOutcome value) {
+        using enum TransferOutcome;
+        done += value == Moved || value == Copied || value == Partial ? 1 : 0;
+        failed += value == Failed || value == Partial ? 1 : 0;
+        skipped += value == Skipped ? 1 : 0;
+        cancelled += value == Cancelled ? 1 : 0;
+      }
+      std::string summary() const {
+        return std::format(
+            "Merge: {} completed, {} failed/partial, {} skipped, {} cancelled.", done, failed, skipped, cancelled
+        );
+      }
+    };
+
     TransferResult merge(Node& node, int destination, TransferAction action, Work& work, const struct stat& existing) {
       // Native move history captures changed leaves and retains emptied source containers.
       if (action != TransferAction::Copy) {
@@ -603,25 +619,19 @@ namespace luciole::transfer {
             && action == TransferAction::Move
             && std::ranges::all_of(node.children, [](const auto& child) { return child->result.outcome == Moved; });
       }
-      std::size_t done = 0, failed = 0, skipped = 0, cancelled = 0;
+      MergeCounts counts;
       for (const auto& child : node.children) {
-        const auto value = child->result.outcome;
-        done += value == Moved || value == Copied || value == Partial ? 1 : 0;
-        failed += value == Failed || value == Partial ? 1 : 0;
-        skipped += value == Skipped ? 1 : 0;
-        cancelled += value == Cancelled ? 1 : 0;
+        counts.add(child->result.outcome);
       }
-      result.outcome = done > 0                    ? Partial
-          : failed > 0 || result.error.has_value() ? (work.token.cancelled() ? Cancelled : Failed)
-          : cancelled > 0                          ? Cancelled
-                                                   : Skipped;
+      result.outcome = counts.done > 0                    ? Partial
+          : counts.failed > 0 || result.error.has_value() ? (work.token.cancelled() ? Cancelled : Failed)
+          : counts.cancelled > 0                          ? Cancelled
+                                                          : Skipped;
       result.retryable = result.retryable || (!node.merging && result.outcome == Failed);
       if (!result.error) {
         result.error = FileError{
             .kind = FileErrorKind::Other,
-            .message = std::format(
-                "Merge: {} completed, {} failed/partial, {} skipped, {} cancelled.", done, failed, skipped, cancelled
-            ),
+            .message = counts.summary(),
         };
         const auto problem =
             std::ranges::find_if(node.children, [](const auto& child) { return child->result.error.has_value(); });
@@ -722,20 +732,14 @@ namespace luciole::transfer {
           if (!node.result.error) {
             node.result.error = partialChild.error;
           } else if (node.result.error->message.starts_with("Merge: ")) {
-            using enum TransferOutcome;
-            std::size_t done = 0, failed = 0, skipped = 0, cancelled = 0;
+            MergeCounts counts;
             for (const auto& committed : result.children) {
-              done += committed.outcome == Moved || committed.outcome == Copied || committed.outcome == Partial ? 1 : 0;
-              failed += committed.outcome == Failed || committed.outcome == Partial ? 1 : 0;
-              skipped += committed.outcome == Skipped ? 1 : 0;
-              cancelled += committed.outcome == Cancelled ? 1 : 0;
+              counts.add(committed.outcome);
             }
             node.result.error = FileError{
                 .kind = partialChild.error->kind,
-                .message = std::format(
-                    "Merge: {} completed, {} failed/partial, {} skipped, {} cancelled. {}: {}", done, failed, skipped,
-                    cancelled, partialChild.source.uri(), partialChild.error->message
-                ),
+                .message =
+                    std::format("{} {}: {}", counts.summary(), partialChild.source.uri(), partialChild.error->message),
             };
           } else if (!node.result.error->message.contains(partialChild.error->message)) {
             if (node.result.error->kind == FileErrorKind::Cancelled) {
