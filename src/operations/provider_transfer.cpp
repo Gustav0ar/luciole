@@ -20,6 +20,8 @@ namespace {
   constexpr const char* kAttributes = "standard::type,standard::is-symlink,standard::size,standard::symlink-target,"
                                       "id::file,id::filesystem,etag::value,time::modified,time::modified-usec,access::"
                                       "can-write,access::can-read,unix::mode";
+  constexpr const char* kIncompleteMerge = "Some folder contents were not transferred.";
+  constexpr const char* kRetainedMergeSource = "Some items were copied; the original merge source remains.";
   using Info = GioPtr<GFileInfo>;
   [[noreturn]] void fail(GError* raw, const char* operation = "Transfer") {
     const GErrorPtr error(raw);
@@ -386,8 +388,8 @@ namespace {
       }
       if (partialError) {
         if (!node.result.error
-            || node.result.error->message == "Some folder contents were not transferred."
-            || node.result.error->message == "Some items were copied; the original merge source remains.") {
+            || node.result.error->message == kIncompleteMerge
+            || node.result.error->message == kRetainedMergeSource) {
           node.result.error = std::move(partialError);
         } else if (!node.result.error->message.contains(partialError->message)) {
           node.result.error->kind = partialError->kind;
@@ -652,14 +654,9 @@ struct luciole::ProviderTransfer::State {
     node.result.outcome = complete ? (action == TransferAction::Move ? TransferOutcome::Moved : TransferOutcome::Copied)
                                    : TransferOutcome::Partial;
     node.result.error = complete ? std::nullopt
-        : partialError           ? partialError
-                                 : std::optional(
-                                       FileError{
-                                           FileErrorKind::Other,
-                                           node.mergeSource ? "Some items were copied; the original merge source remains."
-                                                            : "Some folder contents were not transferred."
-                                       }
-                                   );
+        : partialError
+        ? partialError
+        : std::optional(FileError{FileErrorKind::Other, node.mergeSource ? kRetainedMergeSource : kIncompleteMerge});
   }
 
   bool resolveConflict(
