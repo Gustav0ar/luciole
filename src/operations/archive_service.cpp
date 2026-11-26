@@ -109,6 +109,17 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
     );
     notify();
   }
+  // Returns whether a pending password prompt was cancelled and cleaned up.
+  bool cancelPassword() {
+    if (phase != ArchivePhase::WaitingPassword) {
+      return false;
+    }
+    request.reset();
+    password.reset();
+    error = FileError{FileErrorKind::Cancelled, "Archive operation cancelled."};
+    clean({});
+    return true;
+  }
   void transferChanged() {
     if (transfers.busy()) {
       notify();
@@ -342,12 +353,7 @@ void luciole::ArchiveService::cancel() {
   }
   m_state->cancel.cancel();
   m_state->transfers.cancel();
-  if (m_state->phase == ArchivePhase::WaitingPassword) {
-    m_state->request.reset();
-    m_state->password.reset();
-    m_state->error = FileError{FileErrorKind::Cancelled, "Archive operation cancelled."};
-    m_state->clean({});
-  }
+  m_state->cancelPassword();
 }
 void luciole::ArchiveService::shutdown() {
   if (m_state->closing) {
@@ -356,12 +362,7 @@ void luciole::ArchiveService::shutdown() {
   m_state->closing = true;
   m_state->cancel.cancel();
   m_state->transfers.shutdown();
-  if (m_state->phase == ArchivePhase::WaitingPassword) {
-    m_state->request.reset();
-    m_state->password.reset();
-    m_state->error = FileError{FileErrorKind::Cancelled, "Archive operation cancelled."};
-    m_state->clean({});
-  } else if (!busy()) {
+  if (!m_state->cancelPassword() && !busy()) {
     m_state->clean({});
   }
 }
