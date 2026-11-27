@@ -15,6 +15,7 @@
 #include "wayland/wayland_seat.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <initializer_list>
 #include <memory>
@@ -170,7 +171,11 @@ void ShortcutsController::open() {
     row(singleWindow && text == "New tab / new window" ? "New tab" : text, keys);
   }
   heading("Commands");
+  std::array<bool, luciole::kKeybindCommandCount> listed{};
   for (const auto& definition : luciole::ActionRegistry::definitions()) {
+    if (definition.keybind && std::exchange(listed[std::to_underlying(*definition.keybind)], true)) {
+      continue;
+    }
     const std::string keys = luciole::actionShortcutLabel(definition.action);
     if (!keys.empty()) {
       row(definition.label, keys);
