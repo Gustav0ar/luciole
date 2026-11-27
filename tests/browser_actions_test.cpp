@@ -606,6 +606,56 @@ namespace {
     TEST_CHECK(!R::state(A::Compress, c, R::capture(c)).enabled);
     TEST_CHECK(R::openAction(c, R::capture(c)) == A::Open);
   }
+  void testBatchArchiveActions() {
+    luciole::DirectoryModel model;
+    auto data = snapshot();
+    test::editEntries(data, [](auto& entries) {
+      entries.push_back(entry(7, "one.zip"));
+      entries.push_back(entry(8, "two.tar"));
+    });
+    model.applySnapshot(data);
+    model.select(7);
+    model.select(8, luciole::SelectionMode::Toggle);
+    luciole::ActionContext context{.model = model, .context = 9, .query = {}, .pinned = {}};
+    const auto request = R::capture(context);
+    TEST_CHECK(request.targets.size() == 2);
+    TEST_CHECK(R::state(A::ExtractHere, context, request).enabled && R::state(A::ExtractTo, context, request).enabled);
+    TEST_CHECK(!R::state(A::BrowseArchive, context, request).enabled);
+    context.operationsBusy = true;
+    TEST_CHECK(!R::state(A::ExtractHere, context, request).enabled);
+    context.operationsBusy = false;
+    context.chooser = true;
+    TEST_CHECK(!R::state(A::ExtractTo, context, request).enabled);
+    context.chooser = false;
+    model.select(1, luciole::SelectionMode::Toggle);
+    TEST_CHECK(!R::state(A::ExtractHere, context, R::capture(context)).enabled);
+    model.select(1, luciole::SelectionMode::Toggle);
+    for (unsigned mode = 0; mode < 4; ++mode) {
+      auto invalid = data;
+      test::editEntries(invalid, [mode](auto& entries) {
+        auto& target = entries.back();
+        if (mode == 0) {
+          target.symlink = true;
+        }
+        if (mode == 1) {
+          target.access.read = false;
+        }
+        if (mode == 2) {
+          target.place = luciole::Location::fromUri("sftp://example.invalid/two.tar");
+        }
+        if (mode == 3) {
+          target.type = luciole::FileType::Directory;
+        }
+      });
+      ++invalid.generation;
+      model.applySnapshot(invalid);
+      TEST_CHECK(!R::state(A::ExtractTo, context, R::capture(context)).enabled);
+    }
+    model.applySnapshot(data);
+    model.clearSelection();
+    TEST_CHECK(!R::state(A::ExtractHere, context, R::capture(context)).enabled);
+  }
+
   void testSplitArchiveActions() {
     luciole::DirectoryModel model;
     auto data = snapshot();
@@ -1054,6 +1104,7 @@ int main() {
     testPointerActivation();
     testTerminalActions();
     testArchiveActions();
+    testBatchArchiveActions();
     testSplitArchiveActions();
     testCompressedArchiveActions();
     testExecutionActions();

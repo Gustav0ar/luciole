@@ -3,10 +3,12 @@
 #include "fs/background_job.h"
 #include "fs/native_listing.h"
 #include "fs/system_mounts.h"
+#include "operations/archive_batch.h"
 #include "operations/archive_icons.h"
 #include "operations/archive_work.h"
 #include "operations/transfer_writeback.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <glib.h>
 #include <utility>
@@ -36,6 +38,7 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
   std::optional<ArchivePasswordRequest> password;
   std::uint64_t nextPassword = 0;
   ArchiveLimits limits;
+  std::optional<transfer::WritebackOps> writeback;
   archive_work::Progress progress;
   ArchivePhase phase = ArchivePhase::Idle;
   std::function<void()> changed;
@@ -56,7 +59,7 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
   std::shared_ptr<State> transferLifetime;
   std::vector<TransferResult> results;
   explicit State(ArchiveLimits value) : limits(value) {}
-  State(transfer::WritebackOps ops, ArchiveLimits value) : limits(value), transfers(std::move(ops)) {}
+  State(transfer::WritebackOps ops, ArchiveLimits value) : limits(value), writeback(ops), transfers(std::move(ops)) {}
   ~State() {
     if (timer) {
       g_source_destroy(timer);
@@ -225,7 +228,8 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
       Operation operation, std::vector<Location> sources, const std::optional<Location>& destination,
       ArchiveFormat format, ArchiveCompressionLevel level, std::vector<std::string> selected,
       std::shared_ptr<const ArchiveCatalog> known = nullptr,
-      std::shared_ptr<archive_work::Passwords> passwords = nullptr, std::shared_ptr<const ArchiveLease> lease = {}
+      std::shared_ptr<archive_work::Passwords> passwords = nullptr, std::shared_ptr<const ArchiveLease> lease = {},
+      std::string expectedStamp = {}
   ) {
     if (phase != ArchivePhase::Idle || closing || sources.empty()) {
       return false;
@@ -243,7 +247,7 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
       known = catalog;
     }
     auto expected = (known && known->source == sources.front()) ? std::move(known) : nullptr;
-    progress.sourceStamp.clear();
+    progress.sourceStamp = std::move(expectedStamp);
     password.reset();
     if (operation == Operation::Inspect) {
       catalog.reset();
@@ -362,6 +366,10 @@ luciole::ArchiveService::~ArchiveService() {
   shutdown();
 }
 bool luciole::ArchiveService::inspect(Location source, std::shared_ptr<const ArchiveLease> lease) {
+  if (busy() || m_state->closing) {
+    return false;
+  }
+  m_batch.reset();
   return m_state->start(
       State::Operation::Inspect, {std::move(source)}, std::nullopt, ArchiveFormat::Zip,
       ArchiveCompressionLevel::Balanced, {}, nullptr, nullptr, std::move(lease)
@@ -371,6 +379,10 @@ bool luciole::ArchiveService::compress(
     std::vector<Location> sources, Location destination, ArchiveFormat format, ArchiveCompressionLevel level,
     std::string password
 ) {
+  if (busy() || m_state->closing) {
+    return false;
+  }
+  m_batch.reset();
   auto passwords = std::make_shared<archive_work::Passwords>();
   if (!password.empty()) {
     passwords->values.push_back(std::move(password));
@@ -387,15 +399,19 @@ bool luciole::ArchiveService::compress(
 }
 bool luciole::ArchiveService::extract(
     Location source, Location destination, std::vector<std::string> selected,
-    std::shared_ptr<const ArchiveCatalog> expected
+    std::shared_ptr<const ArchiveCatalog> expected, std::string expectedStamp
 ) {
+  if (busy() || m_state->closing) {
+    return false;
+  }
+  m_batch.reset();
   return m_state->start(
       State::Operation::Extract, {std::move(source)}, std::move(destination), ArchiveFormat::Zip,
-      ArchiveCompressionLevel::Balanced, std::move(selected), std::move(expected)
+      ArchiveCompressionLevel::Balanced, std::move(selected), std::move(expected), nullptr, {}, std::move(expectedStamp)
   );
 }
 bool luciole::ArchiveService::openMember(const std::string& path) {
-  if (!m_state->catalog) {
+  if (busy() || m_state->closing || m_batch || !m_state->catalog) {
     return false;
   }
   return m_state->start(
@@ -407,6 +423,10 @@ void luciole::ArchiveService::cancel() {
   if (flushPhase() == TransferFlush::Final) {
     return;
   }
+  if (m_batch) {
+    m_batch->cancel();
+    return;
+  }
   m_state->cancel.cancel();
   m_state->transfers.cancel();
   m_state->cancelPassword();
@@ -416,22 +436,38 @@ void luciole::ArchiveService::shutdown() {
     return;
   }
   m_state->closing = true;
+  if (m_batch) {
+    m_batch->cancel(true);
+  }
   m_state->cancel.cancel();
   m_state->transfers.shutdown();
-  if (!m_state->cancelPassword() && !busy()) {
+  if (!m_state->cancelPassword() && m_state->phase == ArchivePhase::Idle) {
     m_state->clean({});
   }
 }
-bool luciole::ArchiveService::busy() const { return m_state->phase != ArchivePhase::Idle; }
-luciole::TransferFlush luciole::ArchiveService::flushPhase() const { return m_state->transfers.flushPhase(); }
-luciole::ArchivePhase luciole::ArchiveService::phase() const { return m_state->phase; }
+bool luciole::ArchiveService::busy() const {
+  return (m_batch && m_batch->running) || m_state->phase != ArchivePhase::Idle;
+}
+luciole::TransferFlush luciole::ArchiveService::flushPhase() const {
+  return m_batch ? m_batch->worker->flushPhase() : m_state->transfers.flushPhase();
+}
+luciole::ArchivePhase luciole::ArchiveService::phase() const {
+  return m_batch && m_state->phase == ArchivePhase::Idle ? m_batch->phase() : m_state->phase;
+}
 std::uint64_t luciole::ArchiveService::bytes() const {
+  if (m_batch) {
+    return m_batch->worker->bytes();
+  }
   return m_state->phase == ArchivePhase::Transferring ? m_state->transfers.bytes() : m_state->progress.bytes.load();
 }
-std::size_t luciole::ArchiveService::items() const { return m_state->progress.items.load(); }
-const std::optional<luciole::FileError>& luciole::ArchiveService::error() const { return m_state->error; }
+std::size_t luciole::ArchiveService::items() const {
+  return m_batch ? m_batch->worker->items() : m_state->progress.items.load();
+}
+const std::optional<luciole::FileError>& luciole::ArchiveService::error() const {
+  return !m_state->error && m_batch && !m_batch->running ? m_batch->error : m_state->error;
+}
 const std::shared_ptr<const luciole::ArchiveCatalog>& luciole::ArchiveService::catalog() const {
-  return m_state->catalog;
+  return m_batch ? m_batch->worker->catalog() : m_state->catalog;
 }
 std::optional<luciole::ArchiveMember> luciole::ArchiveService::takeOpenedMember() {
   auto member = std::exchange(m_state->opened, std::nullopt);
@@ -440,21 +476,26 @@ std::optional<luciole::ArchiveMember> luciole::ArchiveService::takeOpenedMember(
   }
   return member;
 }
-const std::vector<luciole::TransferResult>& luciole::ArchiveService::results() const { return m_state->results; }
+const std::vector<luciole::TransferResult>& luciole::ArchiveService::results() const {
+  return m_batch ? m_batch->results : m_state->results;
+}
 std::optional<luciole::TransferConflict> luciole::ArchiveService::conflict() const {
-  return m_state->transfers.conflict();
+  return m_batch ? m_batch->worker->conflict() : m_state->transfers.conflict();
 }
 bool luciole::ArchiveService::resolve(std::uint64_t id, TransferConflictChoice choice) {
-  return m_state->transfers.resolve(id, choice);
+  return m_batch ? m_batch->worker->resolve(id, choice) : m_state->transfers.resolve(id, choice);
 }
 void luciole::ArchiveService::setChangedCallback(std::function<void()> callback) {
   m_state->changed = std::move(callback);
 }
 
 std::optional<luciole::ArchivePasswordRequest> luciole::ArchiveService::passwordRequest() const {
-  return m_state->password;
+  return m_batch ? m_batch->worker->passwordRequest() : m_state->password;
 }
 bool luciole::ArchiveService::providePassword(std::uint64_t id, std::string password) {
+  if (m_batch) {
+    return m_batch->worker->providePassword(id, std::move(password));
+  }
   archive_work::Passwords incoming;
   incoming.values.push_back(std::move(password));
   auto& value = incoming.values.back();
@@ -474,4 +515,34 @@ bool luciole::ArchiveService::providePassword(std::uint64_t id, std::string pass
   m_state->password.reset();
   m_state->launch();
   return true;
+}
+
+bool luciole::ArchiveService::extractMany(std::vector<Location> sources, const std::optional<Location>& parent) {
+  if (busy()
+      || m_state->closing
+      || sources.empty()
+      || (parent && !parent->nativePath())
+      || std::ranges::any_of(sources, [](const Location& source) {
+           return !source.nativePath() || !source.parent();
+         })) {
+    return false;
+  }
+  auto child = m_state->writeback ? std::make_unique<ArchiveService>(*m_state->writeback, m_state->limits)
+                                  : std::make_unique<ArchiveService>(m_state->limits);
+  m_state->error.reset();
+  m_state->opened.reset();
+  m_state->results.clear();
+  const std::weak_ptr<State> weak = m_state;
+  m_batch = std::make_shared<ArchiveBatch>(std::move(child), [weak] {
+    if (const auto owner = weak.lock()) {
+      owner->notify();
+    }
+  });
+  m_batch->start(std::move(sources), parent);
+  return true;
+}
+std::size_t luciole::ArchiveService::archiveCount() const { return m_batch ? m_batch->plan.tasks.size() : 0; }
+std::size_t luciole::ArchiveService::completedArchives() const { return m_batch ? m_batch->index : 0; }
+std::optional<luciole::Location> luciole::ArchiveService::currentArchive() const {
+  return m_batch ? m_batch->source() : std::nullopt;
 }

@@ -55,10 +55,20 @@ void ArchiveController::compress(const std::vector<luciole::DirectoryEntry>& tar
   openDialog(std::move(sources), {}, true);
 }
 
-void ArchiveController::extractTo(const luciole::Location& archive) { openDialog({archive}, {}, false); }
+void ArchiveController::extractTo(std::vector<luciole::Location> archives) {
+  openDialog(std::move(archives), {}, false);
+}
 
-void ArchiveController::extractHere(const luciole::Location& archive) {
-  if (!extract(archive, destination(archive), {})) {
+void ArchiveController::extractHere(std::vector<luciole::Location> archives) {
+  if (archives.empty()) {
+    return;
+  }
+  const bool started = archives.size() == 1
+      ? extract(archives.front(), destination(archives.front()), {})
+      : m_page.jobs().create<luciole::ArchiveService>()->service<luciole::ArchiveService>().extractMany(
+            std::move(archives)
+        );
+  if (!started) {
     m_page.actionError("Could not start extraction.");
   }
 }
@@ -203,10 +213,12 @@ void ArchiveController::openDialog(
     return;
   }
   const auto base = compress ? *parent : containingFolder(source);
+  const auto archiveCount = compress ? 1 : sources.size();
+  const bool batch = archiveCount > 1;
   const std::string name = (sources.size() == 1 ? source.displayName().value_or("Archive") : "Archive")
       + (formats.empty() ? ".zip" : std::string(formats.front().suffix));
   auto root = std::make_unique<ArchiveDialog>(
-      compress, name, luciole::locationEditText(compress ? base : destination(source)),
+      compress, name, luciole::locationEditText(compress || batch ? base : destination(source)),
       [this, sources = std::move(sources), selected = std::move(selected), base, compress](
           const std::string& name, const std::string& path, luciole::ArchiveFormat format,
           luciole::ArchiveCompressionLevel level, const std::string& password
@@ -233,6 +245,10 @@ void ArchiveController::openDialog(
             ? m_page.jobs().create<luciole::ArchiveService>()->service<luciole::ArchiveService>().compress(
                   sources, destination, format, level, password
               )
+            : sources.size() > 1
+            ? m_page.jobs().create<luciole::ArchiveService>()->service<luciole::ArchiveService>().extractMany(
+                  sources, destination
+              )
             : extract(sources.front(), destination, selected);
         if (!started) {
           return "Could not start the archive operation.";
@@ -240,7 +256,7 @@ void ArchiveController::openDialog(
         m_page.dismissPopup();
         return {};
       },
-      [this] { m_page.dismissPopup(); }
+      [this] { m_page.dismissPopup(); }, archiveCount
   );
   auto* dialog = root.get();
   m_page.showDialog(std::move(root), DialogWidth::Medium);

@@ -207,12 +207,21 @@ std::vector<ContextMenuControlEntry> MenuController::itemMenuEntries(const lucio
   }
   entries.push_back({.id = CopyLocation, .label = "Copy Location", .hasSubmenu = true, .glyph = "file-text"});
   addSeparator(entries);
-  if (single != nullptr) {
-    if (luciole::isSupportedArchive(*singleLocation, single->contentType.value_or(""))) {
+  const bool archives = std::ranges::all_of(request.targets, [&model](const auto& target) {
+    const auto* entry = model.entry(target.id);
+    return entry
+        && entry->type == luciole::FileType::Regular
+        && !entry->symlink
+        && luciole::isSupportedArchive(entry->location(), entry->contentType.value_or(""));
+  });
+  if (archives) {
+    if (one) {
       add(Action::BrowseArchive);
-      add(Action::ExtractHere);
-      add(Action::ExtractTo);
     }
+    add(Action::ExtractHere);
+    add(Action::ExtractTo);
+  }
+  if (single != nullptr) {
     // Only useful when the item lives outside the shown folder (search results); otherwise it reopens this one.
     if (singleLocation->parent() != model.snapshot().location) {
       add(Action::ContainingFolder);

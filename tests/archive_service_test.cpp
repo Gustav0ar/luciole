@@ -2484,6 +2484,224 @@ esac
     }
     TEST_CHECK(cancelled);
   }
+  void testBatchExtraction(const Fixture& fixture, Pump& pump) {
+    const auto root = fixture.root / "batch";
+    fs::create_directories(root / "input");
+    fs::create_directories(root / "output");
+    const auto first = root / "input/same.zip", second = root / "input/same.tar";
+    makeArchive(first, {{"a.txt", "first batch bytes", ""}}, ARCHIVE_FORMAT_ZIP);
+    tar(second, {{"b.txt", "second batch bytes", ""}});
+    const auto firstBytes = read(first), secondBytes = read(second);
+    luciole::ArchiveService service;
+    TEST_CHECK(!service.extractMany({}));
+    TEST_CHECK(service.extractMany({location(first), location(second)}, location(root / "output")));
+    TEST_CHECK(service.busy() && service.archiveCount() == 2);
+    TEST_CHECK(!service.inspect(location(first)) && !service.extractMany({location(first)}));
+    wait(service, pump);
+    TEST_CHECK(!service.error() && service.completedArchives() == 2 && service.results().size() == 2);
+    TEST_CHECK(service.results()[0].source == location(first) && service.results()[1].source == location(second));
+    TEST_CHECK(read(root / "output/same/a.txt") == "first batch bytes");
+    TEST_CHECK(read(root / "output/same (1)/b.txt") == "second batch bytes");
+    TEST_CHECK(service.inspect(location(first)));
+    wait(service, pump);
+    TEST_CHECK(service.catalog() && !service.error());
+
+    const auto broken = root / "input/broken.zip", good = root / "input/good.tar";
+    write(broken, "not an archive");
+    tar(good, {{"good.txt", "after failed archive", ""}});
+    TEST_CHECK(service.extractMany({location(broken), location(good)}, location(root / "output")));
+    wait(service, pump);
+    TEST_CHECK(service.error() && service.results().size() == 2);
+    TEST_CHECK(service.results()[0].outcome == luciole::TransferOutcome::Failed);
+    TEST_CHECK(service.results()[1].outcome == luciole::TransferOutcome::Moved);
+    TEST_CHECK(!fs::exists(root / "output/broken") && read(root / "output/good/good.txt") == "after failed archive");
+
+    const auto alias = root / "alias";
+    fs::create_directory_symlink(root / "input", alias);
+    TEST_CHECK(service.extractMany({location(first), location(alias / "same.tar")}));
+    wait(service, pump);
+    TEST_CHECK(!service.error());
+    TEST_CHECK(read(root / "input/same/a.txt") == "first batch bytes");
+    TEST_CHECK(read(root / "input/same (1)/b.txt") == "second batch bytes");
+    TEST_CHECK(read(first) == firstBytes && read(second) == secondBytes);
+    fs::create_directories(root / "left");
+    fs::create_directories(root / "right");
+    const auto left = root / "left/item.tar", right = root / "right/item.zip";
+    tar(left, {{"left.txt", "left parent bytes", ""}});
+    makeArchive(right, {{"right.txt", "right parent bytes", ""}}, ARCHIVE_FORMAT_ZIP);
+    TEST_CHECK(service.extractMany({location(left), location(right)}));
+    wait(service, pump);
+    TEST_CHECK(!service.error() && read(root / "left/item/left.txt") == "left parent bytes");
+    TEST_CHECK(read(root / "right/item/right.txt") == "right parent bytes");
+    TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
+  }
+  void testBatchConflictAndChanges(const Fixture& fixture, Pump& pump) {
+    const auto root = fixture.root / "batch-conflict";
+    fs::create_directories(root / "output/same");
+    write(root / "output/same/canary", "keep existing");
+    const auto first = root / "same.zip", second = root / "same.tar";
+    makeArchive(first, {{"a.txt", "incoming first", ""}}, ARCHIVE_FORMAT_ZIP);
+    tar(second, {{"b.txt", "incoming second", ""}});
+    luciole::ArchiveService service;
+    TEST_CHECK(service.extractMany({location(first), location(second)}, location(root / "output")));
+    pump.until([&] { return service.conflict().has_value() || !service.busy(); });
+    TEST_CHECK(service.conflict());
+    TEST_CHECK(service.resolve(service.conflict()->id, luciole::TransferConflictChoice::KeepBoth));
+    wait(service, pump);
+    TEST_CHECK(!service.error());
+    TEST_CHECK(read(root / "output/same/canary") == "keep existing");
+    TEST_CHECK(read(root / "output/same (1)/a.txt") == "incoming first");
+    TEST_CHECK(read(root / "output/same (2)/b.txt") == "incoming second");
+    TEST_CHECK(service.results()[0].destination != service.results()[1].destination);
+
+    const auto three = root / "three";
+    fs::create_directories(three / "same");
+    fs::create_directories(three / "same (1)");
+    write(three / "same/canary", "first existing");
+    write(three / "same (1)/canary", "second existing");
+    fs::create_directory(root / "third-input");
+    const auto third = root / "third-input/same.zip";
+    makeArchive(third, {{"c.txt", "incoming third", ""}}, ARCHIVE_FORMAT_ZIP);
+    TEST_CHECK(service.extractMany({location(first), location(second), location(third)}, location(three)));
+    for (unsigned decision = 0; decision < 2; ++decision) {
+      pump.until([&] { return service.conflict().has_value() || !service.busy(); });
+      TEST_CHECK(
+          service.conflict() && service.resolve(service.conflict()->id, luciole::TransferConflictChoice::KeepBoth)
+      );
+      const auto current = service.completedArchives();
+      pump.until([&] { return service.completedArchives() > current; });
+    }
+    wait(service, pump);
+    TEST_CHECK(!service.error());
+    TEST_CHECK(read(three / "same (2)/a.txt") == "incoming first");
+    TEST_CHECK(read(three / "same (1) (1)/b.txt") == "incoming second");
+    TEST_CHECK(read(three / "same (3)/c.txt") == "incoming third");
+    TEST_CHECK(read(three / "same/canary") == "first existing" && read(three / "same (1)/canary") == "second existing");
+
+    const auto decisions = root / "decisions";
+    fs::create_directories(decisions / "same");
+    fs::create_directories(decisions / "same (1)");
+    write(decisions / "same/canary", "skip preserves existing");
+    write(decisions / "same (1)/canary", "replace discards existing");
+    TEST_CHECK(service.extractMany({location(first), location(second)}, location(decisions)));
+    pump.until([&] { return service.conflict().has_value() || !service.busy(); });
+    TEST_CHECK(service.conflict());
+    const auto oldConflict = service.conflict()->id;
+    TEST_CHECK(service.resolve(oldConflict, luciole::TransferConflictChoice::Skip));
+    pump.until([&] { return service.conflict() && service.conflict()->id != oldConflict; });
+    TEST_CHECK(!service.resolve(oldConflict, luciole::TransferConflictChoice::Replace));
+    TEST_CHECK(service.resolve(service.conflict()->id, luciole::TransferConflictChoice::Replace));
+    wait(service, pump);
+    TEST_CHECK(!service.error() && service.results()[0].outcome == luciole::TransferOutcome::Skipped);
+    TEST_CHECK(read(decisions / "same/canary") == "skip preserves existing");
+    TEST_CHECK(!fs::exists(decisions / "same (1)/canary") && read(decisions / "same (1)/b.txt") == "incoming second");
+    TEST_CHECK(service.extractMany({location(first), location(second)}, location(decisions)));
+    pump.until([&] { return service.conflict().has_value() || !service.busy(); });
+    TEST_CHECK(service.conflict() && service.resolve(service.conflict()->id, luciole::TransferConflictChoice::Cancel));
+    wait(service, pump);
+    TEST_CHECK(service.results().size() == 2 && std::ranges::all_of(service.results(), [](const auto& result) {
+                 return result.outcome == luciole::TransferOutcome::Cancelled;
+               }));
+    TEST_CHECK(read(decisions / "same/canary") == "skip preserves existing");
+
+    const auto splitSource = root / "split-source.zip";
+    makeArchive(splitSource, {{"part.txt", "split source preserved", ""}}, ARCHIVE_FORMAT_ZIP);
+    const auto splitBytes = read(splitSource);
+    const auto parts = splitZip(root / "parts", "set.zip", splitBytes, (splitBytes.size() + 1) / 2);
+    TEST_CHECK(parts.size() == 2);
+    const auto secondPart = read(parts[1]);
+    const auto replacingPart = root / "parts/set.zip.002.tar";
+    tar(replacingPart, {{"bad.txt", "must not replace a split input part", ""}});
+    TEST_CHECK(service.extractMany({location(parts[0]), location(replacingPart)}));
+    pump.until([&] { return !service.busy() || service.conflict().has_value(); });
+    TEST_CHECK(!service.busy() && !service.conflict() && service.results().size() == 2);
+    TEST_CHECK(service.results()[0].outcome == luciole::TransferOutcome::Moved);
+    TEST_CHECK(service.results()[1].outcome == luciole::TransferOutcome::Failed);
+    TEST_CHECK(read(parts[1]) == secondPart && read(root / "parts/set/part.txt") == "split source preserved");
+
+    const auto cancelled = root / "cancelled";
+    fs::create_directory(cancelled);
+    TEST_CHECK(service.extractMany({location(first), location(second)}, location(cancelled)));
+    service.cancel();
+    wait(service, pump);
+    TEST_CHECK(service.results().size() == 2 && fs::is_empty(cancelled));
+    TEST_CHECK(std::ranges::all_of(service.results(), [](const auto& result) {
+      return result.outcome == luciole::TransferOutcome::Cancelled;
+    }));
+
+    const auto changed = root / "changed";
+    fs::create_directories(changed / "same");
+    write(changed / "same/canary", "unchanged conflict");
+    TEST_CHECK(service.extractMany({location(first), location(second)}, location(changed)));
+    pump.until([&] { return service.conflict().has_value() || !service.busy(); });
+    TEST_CHECK(service.conflict());
+    write(second, read(second) + "queued source changed");
+    TEST_CHECK(service.resolve(service.conflict()->id, luciole::TransferConflictChoice::Skip));
+    wait(service, pump);
+    TEST_CHECK(service.results().size() == 2);
+    TEST_CHECK(service.results()[0].outcome == luciole::TransferOutcome::Skipped);
+    TEST_CHECK(service.results()[1].error && service.results()[1].error->kind == luciole::FileErrorKind::Changed);
+    TEST_CHECK(!fs::exists(changed / "same (1)"));
+
+    const auto guarded = root / "guarded.zip", selected = root / "guarded/selected.tar";
+    fs::create_directory(root / "guarded");
+    makeArchive(guarded, {{"replace.txt", "must not replace source parent", ""}}, ARCHIVE_FORMAT_ZIP);
+    tar(selected, {{"safe.txt", "selected source retained", ""}});
+    const auto original = read(selected);
+    TEST_CHECK(service.extractMany({location(guarded), location(selected)}));
+    wait(service, pump);
+    TEST_CHECK(service.results()[0].outcome == luciole::TransferOutcome::Failed && !service.conflict());
+    TEST_CHECK(read(selected) == original && read(root / "guarded/selected/safe.txt") == "selected source retained");
+    TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
+  }
+  void testBatchPasswords(const Fixture& fixture, Pump& pump) {
+    const auto root = fixture.root / "batch-passwords";
+    fs::create_directory(root);
+    const auto first = root / "first.zip", second = root / "second.zip", third = root / "third.tar";
+    encryptedZip(first, "aes256", "first.txt");
+    encryptedZip(second, "aes256", "second.txt");
+    tar(third, {{"third.txt", "after encrypted archives", ""}});
+    for (const bool cancel : {false, true}) {
+      const auto output = root / (cancel ? "cancel" : "complete");
+      fs::create_directory(output);
+      luciole::ArchiveService service;
+      TEST_CHECK(service.extractMany({location(first), location(second), location(third)}, location(output)));
+      const auto firstPrompt = passwordRequest(service, pump);
+      TEST_CHECK(firstPrompt.source == location(first));
+      TEST_CHECK(service.providePassword(firstPrompt.id, "wrong password"));
+      const auto retry = passwordRequest(service, pump);
+      TEST_CHECK(retry.retry && retry.id != firstPrompt.id);
+      TEST_CHECK(service.providePassword(retry.id, "test password"));
+      pump.until([&] { return service.passwordRequest() && service.passwordRequest()->source == location(second); });
+      const auto secondPrompt = *service.passwordRequest();
+      TEST_CHECK(secondPrompt.id != retry.id && !secondPrompt.retry);
+      TEST_CHECK(!service.providePassword(retry.id, "test password"));
+      if (cancel) {
+        service.cancel();
+      } else {
+        TEST_CHECK(service.providePassword(secondPrompt.id, "test password"));
+      }
+      wait(service, pump);
+      TEST_CHECK(read(output / "first/first.txt") == "secret");
+      TEST_CHECK(service.results().size() == 3);
+      if (cancel) {
+        TEST_CHECK(service.results()[0].outcome == luciole::TransferOutcome::Moved);
+        TEST_CHECK(service.results()[1].outcome == luciole::TransferOutcome::Cancelled);
+        TEST_CHECK(service.results()[2].outcome == luciole::TransferOutcome::Cancelled);
+        TEST_CHECK(!fs::exists(output / "second") && !fs::exists(output / "third"));
+      } else {
+        TEST_CHECK(!service.error() && read(output / "second/second.txt") == "secret");
+        TEST_CHECK(read(output / "third/third.txt") == "after encrypted archives");
+      }
+      TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
+    }
+    auto service = std::make_unique<luciole::ArchiveService>();
+    TEST_CHECK(service->extractMany({location(first), location(second)}, location(root)));
+    (void)passwordRequest(*service, pump);
+    service.reset();
+    pump.until([&] { return fs::is_empty(fixture.root / "tmp"); });
+  }
+
   int compressedWithoutTools() {
     Fixture fixture;
     Pump pump;
@@ -2575,6 +2793,15 @@ esac
 } // namespace
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--batch-extraction") {
+      Fixture fixture;
+      Pump pump;
+      testBatchExtraction(fixture, pump);
+      testBatchConflictAndChanges(fixture, pump);
+      testBatchPasswords(fixture, pump);
+      std::println("batch archive extraction checks passed");
+      return 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--nested-archives") {
       Fixture fixture;
       Pump pump;
@@ -2645,6 +2872,9 @@ int main(int argc, char** argv) {
     testCompressedTarFailures(fixture, pump);
     testCompressedPaddingLimit(fixture, pump);
     testRoundTrips(fixture, pump);
+    testBatchExtraction(fixture, pump);
+    testBatchConflictAndChanges(fixture, pump);
+    testBatchPasswords(fixture, pump);
     testNestedArchives(fixture, pump);
     testDeepNestedArchives(fixture, pump);
     testNestedArchivePasswords(fixture, pump);

@@ -1514,6 +1514,18 @@ void BrowserPage::runAction(
   static constexpr auto fileClipboard = [](BrowserPage& page, const Call& call) {
     page.copyFiles(call.action, call.targets);
   };
+  static constexpr auto extractArchives = [](BrowserPage& page, const Call& call) {
+    std::vector<luciole::Location> sources;
+    sources.reserve(call.targets.size());
+    for (const auto& target : call.targets) {
+      sources.push_back(target.location());
+    }
+    if (call.action == Action::ExtractHere) {
+      page.m_archiveController.extractHere(std::move(sources));
+    } else {
+      page.m_archiveController.extractTo(std::move(sources));
+    }
+  };
   static constexpr auto pathClipboard = [](BrowserPage& page, const Call& call) {
     page.copyPaths(call.action, call.request, call.targets);
   };
@@ -1591,12 +1603,8 @@ void BrowserPage::runAction(
        [](BrowserPage& page, const Call& call) { page.m_propertiesController.show(call.targets); }},
       {Action::Compress,
        [](BrowserPage& page, const Call& call) { page.m_archiveController.compress(call.targets); }},
-      {Action::ExtractHere,
-       [](BrowserPage& page, const Call& call) {
-         page.m_archiveController.extractHere(call.targets.front().location());
-       }},
-      {Action::ExtractTo,
-       [](BrowserPage& page, const Call& call) { page.m_archiveController.extractTo(call.targets.front().location()); }},
+      {Action::ExtractHere, extractArchives},
+      {Action::ExtractTo, extractArchives},
       {Action::BrowseArchive,
        [](BrowserPage& page, const Call& call) { page.m_archiveController.browse(call.targets.front().location()); }},
       {Action::CreateFolder, createItem},

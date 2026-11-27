@@ -16,6 +16,7 @@ namespace luciole {
   enum class ArchiveEntryKind { File, Directory, Symlink, Hardlink };
   enum class ArchivePhase { Idle, Reading, Compressing, Extracting, Transferring, Cleaning, WaitingPassword };
   struct ArchiveLease;
+  struct ArchiveBatch;
   struct ArchiveMember {
     Location location;
     bool archive = false;
@@ -89,11 +90,17 @@ namespace luciole {
         ArchiveCompressionLevel level = ArchiveCompressionLevel::Balanced, std::string password = {}
     );
     // `expected` is a catalog of `source` read earlier, by this or another instance; extraction fails when the
-    // archive no longer matches it. Without one, the catalog this instance read is used.
+    // archive no longer matches it. Without one, the catalog this instance read is used. Batch preflight can
+    // additionally supply a lightweight source fingerprint captured before an archive waits in the queue.
     bool extract(
         Location source, Location destinationFolder, std::vector<std::string> selected = {},
-        std::shared_ptr<const ArchiveCatalog> expected = nullptr
+        std::shared_ptr<const ArchiveCatalog> expected = nullptr, std::string expectedStamp = {}
     );
+    // Extract each archive into its own folder, beside its source or inside a supplied existing parent.
+    bool extractMany(std::vector<Location> sources, const std::optional<Location>& destinationParent = {});
+    std::size_t archiveCount() const;
+    std::size_t completedArchives() const;
+    std::optional<Location> currentArchive() const;
     bool openMember(const std::string& path);
     void cancel();
     void shutdown();
@@ -115,5 +122,6 @@ namespace luciole {
   private:
     struct State;
     std::shared_ptr<State> m_state;
+    std::shared_ptr<ArchiveBatch> m_batch;
   };
 } // namespace luciole
