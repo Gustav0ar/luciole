@@ -803,9 +803,10 @@ void MenuController::openToolbarMenu(const LayoutRect& anchor, luciole::ToolbarI
     return luciole::moveToolbarItem(settings.toolbarOrder, item, direction, shown);
   };
   // The buttons Settings can hide, each with its Settings label and the preference that shows it.
-  const std::array<std::pair<std::string_view, luciole::PreferenceKey<bool>>, 4> toggles{
+  const std::array<std::pair<std::string_view, luciole::PreferenceKey<bool>>, 5> toggles{
       {{"Sidebar Button", P::ShowSidebarButton},
        {"Parent Folder Button", P::ShowParentButton},
+       {"New Folder Button", P::ShowNewFolderButton},
        {"Sort Button", P::ShowSortButton},
        {"View Switch", P::ShowViewSwitch}}
   };

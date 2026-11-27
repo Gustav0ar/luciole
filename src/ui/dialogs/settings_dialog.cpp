@@ -432,6 +432,7 @@ void SettingsDialog::addToolbar() {
   card("Toolbar");
   addBool(P::ShowSidebarButton, "Sidebar Button");
   addBool(P::ShowParentButton, "Parent Folder Button");
+  addBool(P::ShowNewFolderButton, "New Folder Button");
   addBool(P::ShowSortButton, "Sort Button");
   addBool(P::ShowViewSwitch, "View Switch");
   addChoice(
