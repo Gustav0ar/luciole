@@ -389,7 +389,7 @@ bool luciole::SidebarTreeView::key(std::uint32_t sym, std::uint32_t modifiers) {
     return true;
   }
   if (luciole::keybindMatches(luciole::KeybindCommand::Rename, sym, modifiers) && m_pinIndices.contains(id)) {
-    if (rename && bookmark && bookmark->location != Location::network()) {
+    if (rename && bookmark) {
       rename(*bookmark);
     }
     return true;
