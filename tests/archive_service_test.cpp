@@ -14,6 +14,7 @@
 #include <archive.h>
 #include <archive_entry.h>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <clocale>
 #include <csignal>
@@ -22,6 +23,7 @@
 #include <format>
 #include <fstream>
 #include <gio/gio.h>
+#include <grp.h>
 #include <map>
 #include <print>
 #include <stdexcept>
@@ -121,6 +123,48 @@ namespace {
   }
   void wait(luciole::ArchiveService& service, Pump& pump) {
     pump.until([&] { return !service.busy(); });
+  }
+  void testSearchOnlyAncestors() {
+    // Run in a separate process so root CI can exercise actual read-permission denial.
+    if (::geteuid() == 0) {
+      TEST_CHECK(::setgroups(0, nullptr) == 0);
+      TEST_CHECK(::setgid(65534) == 0 && ::setuid(65534) == 0);
+    }
+    Fixture fixture;
+    Pump pump;
+    const auto users = fixture.root / "users", privateTmp = users / "private";
+    fs::create_directories(privateTmp);
+    TEST_CHECK(::chmod(privateTmp.c_str(), 0700) == 0);
+    const auto archive = fixture.root / "search-only.zip";
+    makeArchive(
+        archive, {{"folder/payload.txt", "private temporary storage", ""}, {"empty", "", "", AE_IFDIR, 0750}},
+        ARCHIVE_FORMAT_ZIP
+    );
+    const auto original = read(archive);
+    TEST_CHECK(::chmod(users.c_str(), 0111) == 0);
+    errno = 0;
+    const int unreadable = ::open(users.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    TEST_CHECK(unreadable == -1 && errno == EACCES);
+    const auto ordinaryTmp = fixture.root / "tmp";
+    for (const bool privateStaging : {true, false}) {
+      const auto tmp = privateStaging ? privateTmp : ordinaryTmp;
+      const auto destination = privateStaging ? fixture.root / "from-private-tmp" : privateTmp / "destination";
+      TEST_CHECK(::setenv("TMPDIR", tmp.c_str(), 1) == 0);
+      luciole::ArchiveService service;
+      TEST_CHECK(service.extract(location(archive), location(destination)));
+      wait(service, pump);
+      TEST_CHECK(!service.error());
+      TEST_CHECK(read(destination / "folder/payload.txt") == "private temporary storage");
+      TEST_CHECK(fs::is_directory(destination / "empty"));
+      if (privateStaging) {
+        TEST_CHECK(fs::is_empty(privateTmp));
+      } else {
+        TEST_CHECK(fs::is_empty(ordinaryTmp));
+      }
+    }
+    TEST_CHECK(read(archive) == original);
+    TEST_CHECK(::setenv("TMPDIR", ordinaryTmp.c_str(), 1) == 0);
+    TEST_CHECK(::chmod(users.c_str(), 0700) == 0);
   }
   void testRoundTrips(const Fixture& fixture, Pump& pump) {
     const auto src = fixture.root / "source";
@@ -2312,6 +2356,10 @@ esac
 } // namespace
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--search-only-ancestors") {
+      testSearchOnlyAncestors();
+      return 0;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--large-sparse-fixture") {
       return makeLargeSparseFixture(argv[2]);
     }
@@ -2405,6 +2453,10 @@ int main(int argc, char** argv) {
         G_SUBPROCESS_FLAGS_NONE, nullptr, "/proc/self/exe", "--bounded-encrypted-write-failure", nullptr
     ));
     TEST_CHECK(writeFailure && g_subprocess_wait_check(writeFailure.get(), nullptr, nullptr));
+    const luciole::GioPtr<GSubprocess> searchOnly(
+        g_subprocess_new(G_SUBPROCESS_FLAGS_NONE, nullptr, "/proc/self/exe", "--search-only-ancestors", nullptr)
+    );
+    TEST_CHECK(searchOnly && g_subprocess_wait_check(searchOnly.get(), nullptr, nullptr));
     TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
     std::println("archive checks passed");
     return 0;
