@@ -91,7 +91,7 @@ namespace luciole {
     // monitor services, so the application calls it after its first frame. Idempotent.
     void start();
 
-    // Local drives, removable devices, then network shares; mounted entries lead each group and "/" stays first.
+    // Local drives, removable devices, then network shares; "/" stays first and surviving entries keep their order.
     const std::vector<Drive>& drives() const;
     const Drive* find(const std::string& key) const;
     void setChangedCallback(std::function<void()> callback);

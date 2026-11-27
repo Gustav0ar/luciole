@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <format>
 #include <fstream>
 #include <gio/gio.h>
@@ -33,8 +35,16 @@ namespace {
         return value.get();
       }
     }
-    const luciole::GString name(g_volume_get_name(volume));
-    return name ? name.get() : "";
+    static const GQuark kFallbackIdQuark = g_quark_from_static_string("luciole-drive-fallback-id");
+    static std::atomic<std::uint64_t> nextFallbackId{1};
+    auto* id = static_cast<std::uint64_t*>(g_object_get_qdata(G_OBJECT(volume), kFallbackIdQuark));
+    if (id == nullptr) {
+      id = new std::uint64_t(nextFallbackId.fetch_add(1, std::memory_order_relaxed));
+      g_object_set_qdata_full(
+          G_OBJECT(volume), kFallbackIdQuark, id, +[](gpointer data) { delete static_cast<std::uint64_t*>(data); }
+      );
+    }
+    return std::format("object:{}", *id);
   }
 
   std::string_view uriScheme(const luciole::Location& location) {
@@ -346,13 +356,42 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
            .kind = DriveKind::Network}
       );
     }
-    // Mounted entries first within each category, ordered Local -> Removable -> Network; root stays at the top.
-    std::ranges::stable_partition(drives, [](const Drive& drive) { return drive.root.has_value(); });
-    std::ranges::stable_sort(drives, {}, [](const Drive& drive) { return static_cast<std::uint8_t>(drive.kind); });
+    // Group Local -> Removable -> Network, keeping surviving rows in their prior order within each section; root stays
+    // first. Each prior slot matches once so duplicate fallback keys keep their interleaved order.
+    struct RankedDrive {
+      Drive drive;
+      std::uint8_t kind = 0;
+      std::size_t prior = 0;
+    };
+    std::vector<std::uint8_t> matched(previous.size(), 0);
+    std::vector<RankedDrive> ranked;
+    ranked.reserve(drives.size());
+    for (auto& drive : drives) {
+      std::size_t prior = previous.size();
+      for (std::size_t i = 0; i < previous.size(); ++i) {
+        if (matched[i] == 0 && previous[i].key == drive.key && previous[i].kind == drive.kind) {
+          matched[i] = 1;
+          prior = i;
+          break;
+        }
+      }
+      const auto kind = static_cast<std::uint8_t>(drive.kind);
+      ranked.push_back({.drive = std::move(drive), .kind = kind, .prior = prior});
+    }
+    std::ranges::stable_sort(ranked, {}, [](const RankedDrive& entry) { return std::pair{entry.kind, entry.prior}; });
+    drives.clear();
+    for (auto& entry : ranked) {
+      drives.push_back(std::move(entry.drive));
+    }
     // Keep the last known usage until the next query answers, so bars do not flicker on rebuilds.
     for (auto& drive : drives) {
-      const auto old = std::ranges::find(previous, drive.key, &Drive::key);
-      if (drive.root && old != previous.end() && old->root == drive.root) {
+      if (!drive.root) {
+        continue;
+      }
+      const auto old = std::ranges::find_if(previous, [&](const Drive& prior) {
+        return prior.key == drive.key && prior.root == drive.root;
+      });
+      if (old != previous.end()) {
         drive.usage = old->usage;
       }
     }
