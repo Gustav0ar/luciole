@@ -262,7 +262,9 @@ namespace {
   }
   State pin(const C& c, const R& r, bool unpin) {
     if (!all(c, r, [](const DirectoryEntry& entry) {
-          return entry.type == FileType::Directory && !entry.location().isTrash();
+          return entry.type == FileType::Directory
+              && !entry.location().isTrash()
+              && entry.location() != luciole::Location::network();
         })) {
       return unavailable("Only folders outside Trash can be pinned.");
     }
@@ -274,7 +276,7 @@ namespace {
     return require(any, unpin ? "These folders are not pinned." : "These folders are already pinned.");
   }
   State pinCurrent(const C& c, const R& r, bool unpin) {
-    if (!r.folder || r.folder->isTrash()) {
+    if (!r.folder || r.folder->isTrash() || *r.folder == luciole::Location::network()) {
       return unavailable("This location cannot be pinned.");
     }
     if (!c.pinsEditable) {

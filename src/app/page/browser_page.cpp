@@ -2063,8 +2063,9 @@ void BrowserPage::applySettings(const luciole::BrowserSettings& settings, bool f
 }
 
 void BrowserPage::showToolbarButtons() {
-  for (const auto& [node, show] : std::array<std::pair<Node*, bool>, 3>{
+  for (const auto& [node, show] : std::array<std::pair<Node*, bool>, 4>{
            {{m_up, m_savedSettings.showParentButton},
+            {m_newFolderButton, choosing() || m_savedSettings.showNewFolderButton},
             {m_sortButton, m_savedSettings.showSortButton},
             {m_viewSwitch, m_savedSettings.showViewSwitch}}
        }) {

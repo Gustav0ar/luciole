@@ -895,20 +895,22 @@ namespace {
     TEST_CHECK(
         defaults.showSidebarButton
         && defaults.showParentButton
+        && defaults.showNewFolderButton
         && defaults.showSortButton
         && defaults.showViewSwitch
         && defaults.operationsButton == OperationsButton::Always
     );
     fixture.write(
         "config.toml",
-        "[browser]\nshow_sidebar_button = false\nshow_parent_button = false\nshow_sort_button = false\n"
-        "show_view_switch = false\noperations_button = \"busy\"\n"
+        "[browser]\nshow_sidebar_button = false\nshow_parent_button = false\nshow_new_folder_button = false\n"
+        "show_sort_button = false\nshow_view_switch = false\noperations_button = \"busy\"\n"
     );
     TEST_CHECK(config.reload());
     const auto& hidden = config.settings().browser;
     TEST_CHECK(
         !hidden.showSidebarButton
         && !hidden.showParentButton
+        && !hidden.showNewFolderButton
         && !hidden.showSortButton
         && !hidden.showViewSwitch
         && hidden.operationsButton == OperationsButton::Busy

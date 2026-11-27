@@ -39,6 +39,7 @@ namespace luciole {
     bool showCloseButtons = true;
     bool showSidebarButton = true;
     bool showParentButton = true;
+    bool showNewFolderButton = true; // File pickers show it regardless.
     bool showSortButton = true;
     bool showViewSwitch = true;
     OperationsButton operationsButton = OperationsButton::Always;
@@ -112,6 +113,7 @@ namespace luciole {
     ShowCloseButtons,
     ShowSidebarButton,
     ShowParentButton,
+    ShowNewFolderButton,
     ShowSortButton,
     ShowViewSwitch,
     OperationsButton,
@@ -222,6 +224,7 @@ namespace luciole {
     static constexpr PreferenceKey<bool> ShowCloseButtons{Id::ShowCloseButtons};
     static constexpr PreferenceKey<bool> ShowSidebarButton{Id::ShowSidebarButton};
     static constexpr PreferenceKey<bool> ShowParentButton{Id::ShowParentButton};
+    static constexpr PreferenceKey<bool> ShowNewFolderButton{Id::ShowNewFolderButton};
     static constexpr PreferenceKey<bool> ShowSortButton{Id::ShowSortButton};
     static constexpr PreferenceKey<bool> ShowViewSwitch{Id::ShowViewSwitch};
     static constexpr PreferenceKey<luciole::OperationsButton> OperationsButton{Id::OperationsButton};

@@ -380,6 +380,7 @@ namespace {
       describe(P::ShowCloseButtons, "show_close_buttons", [](S& s) -> auto& { return s.showCloseButtons; }),
       describe(P::ShowSidebarButton, "show_sidebar_button", [](S& s) -> auto& { return s.showSidebarButton; }),
       describe(P::ShowParentButton, "show_parent_button", [](S& s) -> auto& { return s.showParentButton; }),
+      describe(P::ShowNewFolderButton, "show_new_folder_button", [](S& s) -> auto& { return s.showNewFolderButton; }),
       describe(P::ShowSortButton, "show_sort_button", [](S& s) -> auto& { return s.showSortButton; }),
       describe(P::ShowViewSwitch, "show_view_switch", [](S& s) -> auto& { return s.showViewSwitch; }),
       describe(
