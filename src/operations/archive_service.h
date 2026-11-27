@@ -15,6 +15,12 @@ namespace luciole {
   enum class ArchiveFormat { Zip, Tar, TarGzip, TarBzip2, TarZstd, TarXz, SevenZip };
   enum class ArchiveEntryKind { File, Directory, Symlink, Hardlink };
   enum class ArchivePhase { Idle, Reading, Compressing, Extracting, Transferring, Cleaning, WaitingPassword };
+  struct ArchiveLease;
+  struct ArchiveMember {
+    Location location;
+    bool archive = false;
+    std::shared_ptr<const ArchiveLease> lease = nullptr;
+  };
   struct ArchiveFormatInfo {
     ArchiveFormat format;
     std::string_view label;
@@ -45,6 +51,8 @@ namespace luciole {
     std::uint64_t archiveBytes = 0;
     // One compressed file such as dump.sql.gz, whose only entry has no size until extracted.
     bool single = false;
+    // Keeps a materialized source alive while another archive job reads this catalog.
+    std::shared_ptr<const ArchiveLease> sourceLease = nullptr;
   };
   struct ArchiveLimits {
     // Normal jobs have no policy quotas. Explicit consumers and tests can impose finite budgets.
@@ -75,7 +83,7 @@ namespace luciole {
     ~ArchiveService();
     ArchiveService(const ArchiveService&) = delete;
     ArchiveService& operator=(const ArchiveService&) = delete;
-    bool inspect(Location source);
+    bool inspect(Location source, std::shared_ptr<const ArchiveLease> lease = {});
     bool compress(
         std::vector<Location> sources, Location destinationFile, ArchiveFormat format,
         ArchiveCompressionLevel level = ArchiveCompressionLevel::Balanced, std::string password = {}
@@ -96,7 +104,7 @@ namespace luciole {
     std::size_t items() const;
     const std::optional<FileError>& error() const;
     const std::shared_ptr<const ArchiveCatalog>& catalog() const;
-    std::optional<Location> takeOpenedFile();
+    std::optional<ArchiveMember> takeOpenedMember();
     const std::vector<TransferResult>& results() const;
     std::optional<TransferConflict> conflict() const;
     bool resolve(std::uint64_t id, TransferConflictChoice choice);

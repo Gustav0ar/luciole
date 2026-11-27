@@ -26,6 +26,7 @@
 #include <grp.h>
 #include <map>
 #include <print>
+#include <ranges>
 #include <stdexcept>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -197,13 +198,130 @@ namespace {
       TEST_CHECK(fs::is_symlink(dest / "source/link") && fs::read_symlink(dest / "source/link") == "hello.txt");
       TEST_CHECK(service.openMember("source/hello.txt"));
       wait(service, pump);
-      const auto opened = service.takeOpenedFile();
-      TEST_CHECK(opened && read(*opened->nativePath()) == "archive content");
-      const auto temporary = *opened->nativePath();
+      const auto opened = service.takeOpenedMember();
+      TEST_CHECK(opened && read(*opened->location.nativePath()) == "archive content");
+      const auto temporary = *opened->location.nativePath();
       service.shutdown();
       wait(service, pump);
       TEST_CHECK(!fs::exists(temporary));
     }
+  }
+  void testNestedArchives(const Fixture& fixture, Pump& pump) {
+    const auto inner = fixture.root / "nested-inner.tar", outer = fixture.root / "nested-outer.zip";
+    tar(inner, {{"folder/payload.txt", "nested archive payload", ""}, {"empty", "", "", AE_IFDIR, 0750}});
+    makeArchive(
+        outer,
+        {{"inside/inner.tar", read(inner), ""},
+         {"inside/extensionless", read(inner), ""},
+         {"inside/broken.zip", "not an archive", ""},
+         {"inside/note.txt", "ordinary member", ""}},
+        ARCHIVE_FORMAT_ZIP
+    );
+    const auto original = read(outer);
+    for (const auto& memberPath : {"inside/inner.tar", "inside/extensionless"}) {
+      luciole::ArchiveService parent, child, extraction;
+      TEST_CHECK(parent.inspect(location(outer)));
+      wait(parent, pump);
+      const auto parentCatalog = parent.catalog();
+      TEST_CHECK(parent.openMember(memberPath));
+      wait(parent, pump);
+      auto member = parent.takeOpenedMember();
+      if (!member || !member->archive) {
+        std::println(
+            stderr, "Nested member {}: {}", memberPath,
+            parent.error() ? parent.error()->message : "not recognized as an archive"
+        );
+      }
+      TEST_CHECK(member && member->archive && member->lease);
+      const auto materialized = *member->location.nativePath();
+      TEST_CHECK(read(materialized) == read(inner));
+      TEST_CHECK(child.inspect(member->location, member->lease));
+      member->lease.reset();
+      wait(child, pump);
+      TEST_CHECK(child.catalog() && child.catalog()->entries.size() == 3 && child.catalog()->sourceLease);
+      TEST_CHECK(parent.catalog() == parentCatalog);
+      const auto output = fixture.root / (std::string("nested-extracted-") + fs::path(memberPath).filename().native());
+      TEST_CHECK(extraction.extract(member->location, location(output), {}, child.catalog()));
+      parent.shutdown();
+      child.shutdown();
+      TEST_CHECK(parent.busy() && fs::exists(materialized));
+      wait(extraction, pump);
+      pump.until([&] { return !parent.busy() && !child.busy(); });
+      TEST_CHECK(!parent.error() && !child.error());
+      TEST_CHECK(read(output / "folder/payload.txt") == "nested archive payload" && fs::is_directory(output / "empty"));
+      TEST_CHECK(!fs::exists(materialized) && fs::is_empty(fixture.root / "tmp"));
+    }
+    {
+      luciole::ArchiveService parent, child;
+      TEST_CHECK(parent.inspect(location(outer)));
+      wait(parent, pump);
+      TEST_CHECK(parent.openMember("inside/note.txt"));
+      wait(parent, pump);
+      const auto note = parent.takeOpenedMember();
+      TEST_CHECK(note && !note->archive && !note->lease && read(*note->location.nativePath()) == "ordinary member");
+      TEST_CHECK(parent.openMember("inside/broken.zip"));
+      wait(parent, pump);
+      auto member = parent.takeOpenedMember();
+      TEST_CHECK(member && member->archive && member->lease);
+      TEST_CHECK(child.inspect(member->location, member->lease));
+      member->lease.reset();
+      pump.until([&] { return !child.busy(); });
+      TEST_CHECK(child.error() && !child.catalog());
+      TEST_CHECK(parent.catalog() && parent.catalog()->source == location(outer));
+      child.shutdown();
+      parent.shutdown();
+      pump.until([&] { return !parent.busy() && !child.busy(); });
+    }
+    {
+      luciole::ArchiveService parent, child;
+      TEST_CHECK(parent.inspect(location(outer)));
+      wait(parent, pump);
+      TEST_CHECK(parent.openMember("inside/inner.tar"));
+      wait(parent, pump);
+      auto member = parent.takeOpenedMember();
+      TEST_CHECK(member && member->archive);
+      const auto materialized = *member->location.nativePath();
+      TEST_CHECK(child.inspect(member->location, member->lease));
+      member->lease.reset();
+      child.cancel();
+      child.shutdown();
+      parent.shutdown();
+      pump.until([&] { return !parent.busy() && !child.busy(); });
+      TEST_CHECK(child.error() && child.error()->kind == luciole::FileErrorKind::Cancelled);
+      TEST_CHECK(!fs::exists(materialized));
+    }
+    TEST_CHECK(read(outer) == original && fs::is_empty(fixture.root / "tmp"));
+  }
+  void testNestedArchiveBudget(const Fixture& fixture, Pump& pump) {
+    const auto archive = fixture.root / "nested-budget.zip";
+    makeArchive(archive, {{"payload.txt", "leaf payload", ""}}, ARCHIVE_FORMAT_ZIP);
+    for (unsigned i = 0; i < 34; ++i) {
+      const auto body = read(archive);
+      makeArchive(archive, {{"next.zip", body, ""}}, ARCHIVE_FORMAT_ZIP);
+    }
+    std::vector<std::unique_ptr<luciole::ArchiveService>> levels;
+    levels.push_back(std::make_unique<luciole::ArchiveService>());
+    TEST_CHECK(levels.back()->inspect(location(archive)));
+    wait(*levels.back(), pump);
+    for (unsigned i = 0; i < 32; ++i) {
+      auto& parent = *levels.back();
+      TEST_CHECK(parent.openMember("next.zip"));
+      wait(parent, pump);
+      auto member = parent.takeOpenedMember();
+      TEST_CHECK(member && member->archive && member->lease);
+      auto child = std::make_unique<luciole::ArchiveService>();
+      TEST_CHECK(child->inspect(member->location, member->lease));
+      member->lease.reset();
+      wait(*child, pump);
+      levels.push_back(std::move(child));
+    }
+    TEST_CHECK(!levels.back()->openMember("next.zip"));
+    TEST_CHECK(levels.back()->error() && levels.back()->error()->kind == luciole::FileErrorKind::NoSpace);
+    for (const auto& level : std::views::reverse(levels)) {
+      level->shutdown();
+    }
+    pump.until([&] { return std::ranges::none_of(levels, [](const auto& level) { return level->busy(); }); });
+    TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
   }
   void testLiteralSourceLinks(const Fixture& fixture, Pump& pump) {
     struct ReadLocale {
@@ -693,13 +811,59 @@ namespace {
       TEST_CHECK(service.providePassword(retry.id, "test password"));
       wait(service, pump);
       TEST_CHECK(!service.error() && !service.passwordRequest());
-      const auto opened = service.takeOpenedFile();
-      TEST_CHECK(opened && read(*opened->nativePath()) == "secret");
+      const auto opened = service.takeOpenedMember();
+      TEST_CHECK(opened && read(*opened->location.nativePath()) == "secret");
       struct stat mode{};
-      TEST_CHECK(::stat(opened->nativePath()->c_str(), &mode) == 0 && (mode.st_mode & 0111) == 0);
+      TEST_CHECK(::stat(opened->location.nativePath()->c_str(), &mode) == 0 && (mode.st_mode & 0111) == 0);
       service.shutdown();
       wait(service, pump);
       TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
+    }
+  }
+  void testNestedArchivePasswords(const Fixture& fixture, Pump& pump) {
+    const auto source = fixture.root / "nested-secret.txt", encrypted = fixture.root / "nested-encrypted.zip";
+    const auto outer = fixture.root / "nested-password-outer.tar";
+    write(source, "nested password payload");
+    {
+      luciole::ArchiveService writer;
+      TEST_CHECK(writer.compress(
+          {location(source)}, location(encrypted), luciole::ArchiveFormat::Zip,
+          luciole::ArchiveCompressionLevel::Balanced, "nested password"
+      ));
+      wait(writer, pump);
+      TEST_CHECK(!writer.error());
+    }
+    tar(outer, {{"encrypted.zip", read(encrypted), ""}});
+    for (const bool cancelPrompt : {false, true}) {
+      luciole::ArchiveService parent, child;
+      TEST_CHECK(parent.inspect(location(outer)));
+      wait(parent, pump);
+      TEST_CHECK(parent.openMember("encrypted.zip"));
+      wait(parent, pump);
+      auto member = parent.takeOpenedMember();
+      TEST_CHECK(member && member->archive && member->lease);
+      const auto materialized = *member->location.nativePath();
+      TEST_CHECK(child.inspect(member->location, member->lease));
+      member->lease.reset();
+      wait(child, pump);
+      TEST_CHECK(child.openMember("nested-secret.txt"));
+      const auto first = passwordRequest(child, pump);
+      TEST_CHECK(first.source == member->location && !first.retry);
+      parent.shutdown();
+      TEST_CHECK(parent.busy() && fs::exists(materialized));
+      if (cancelPrompt) {
+        child.cancel();
+      } else {
+        TEST_CHECK(child.providePassword(first.id, "wrong"));
+        TEST_CHECK(passwordRequest(child, pump).retry);
+        TEST_CHECK(child.providePassword(child.passwordRequest()->id, "nested password"));
+        wait(child, pump);
+        const auto opened = child.takeOpenedMember();
+        TEST_CHECK(opened && !opened->archive && read(*opened->location.nativePath()) == "nested password payload");
+      }
+      child.shutdown();
+      pump.until([&] { return !parent.busy() && !child.busy(); });
+      TEST_CHECK(!fs::exists(materialized) && fs::is_empty(fixture.root / "tmp"));
     }
   }
   void testEncryptedCreation(const Fixture& fixture, Pump& pump) {
@@ -915,8 +1079,8 @@ namespace {
     TEST_CHECK(!service.error() && read(output / plain.filename()) == read(plain));
     TEST_CHECK(service.openMember(plain.filename().native()));
     wait(service, pump);
-    const auto opened = service.takeOpenedFile();
-    TEST_CHECK(opened && read(*opened->nativePath()) == read(plain));
+    const auto opened = service.takeOpenedMember();
+    TEST_CHECK(opened && read(*opened->location.nativePath()) == read(plain));
     service.shutdown();
     wait(service, pump);
     TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
@@ -1287,9 +1451,9 @@ namespace {
       TEST_CHECK(!service.error() && digest(read(selected / reference.member)) == reference.sha256);
       TEST_CHECK(service.openMember(std::string(reference.member)));
       wait(service, pump);
-      const auto opened = service.takeOpenedFile();
-      TEST_CHECK(!service.error() && opened && digest(read(*opened->nativePath())) == reference.sha256);
-      TEST_CHECK((fs::status(*opened->nativePath()).permissions() & fs::perms::owner_exec) == fs::perms::none);
+      const auto opened = service.takeOpenedMember();
+      TEST_CHECK(!service.error() && opened && digest(read(*opened->location.nativePath())) == reference.sha256);
+      TEST_CHECK((fs::status(*opened->location.nativePath()).permissions() & fs::perms::owner_exec) == fs::perms::none);
       write(source, bytes);
       const auto stale = fixture.root / ("rar-stale-" + std::string(reference.name));
       TEST_CHECK(service.extract(location(source), location(stale), {}, known));
@@ -1470,9 +1634,11 @@ namespace {
     request = passwordRequest(service, pump);
     TEST_CHECK(service.providePassword(request.id, "fixture-pass"));
     wait(service, pump);
-    const auto opened = service.takeOpenedFile();
-    TEST_CHECK(!service.error() && opened && read(*opened->nativePath()) == sevenZipPayload("second payload\n"));
-    TEST_CHECK((fs::status(*opened->nativePath()).permissions() & fs::perms::owner_exec) == fs::perms::none);
+    const auto opened = service.takeOpenedMember();
+    TEST_CHECK(
+        !service.error() && opened && read(*opened->location.nativePath()) == sevenZipPayload("second payload\n")
+    );
+    TEST_CHECK((fs::status(*opened->location.nativePath()).permissions() & fs::perms::owner_exec) == fs::perms::none);
     const auto cancelled = fs::path(destination.string() + "-cancelled");
     TEST_CHECK(service.extract(location(source), location(cancelled), {}, known));
     request = passwordRequest(service, pump);
@@ -1491,7 +1657,7 @@ namespace {
     TEST_CHECK(!service.passwordRequest() && !fs::exists(cancelled));
     service.shutdown();
     wait(service, pump);
-    TEST_CHECK(!fs::exists(*opened->nativePath()));
+    TEST_CHECK(!fs::exists(*opened->location.nativePath()));
   }
   void testSevenZipLiteralNames(const Fixture& fixture, Pump& pump, bool encryptedHeader = false) {
     const auto source = fixture.root / "literal.7z",
@@ -1924,9 +2090,11 @@ esac
       );
       TEST_CHECK(service.openMember("second.txt"));
       wait(service, pump);
-      const auto opened = service.takeOpenedFile();
-      TEST_CHECK(!service.error() && opened && read(*opened->nativePath()) == sevenZipPayload("second payload\n"));
-      TEST_CHECK((fs::status(*opened->nativePath()).permissions() & fs::perms::owner_exec) == fs::perms::none);
+      const auto opened = service.takeOpenedMember();
+      TEST_CHECK(
+          !service.error() && opened && read(*opened->location.nativePath()) == sevenZipPayload("second payload\n")
+      );
+      TEST_CHECK((fs::status(*opened->location.nativePath()).permissions() & fs::perms::owner_exec) == fs::perms::none);
       write(source, bytes);
       const auto stale = fixture.root / ("sevenzip-stale-" + std::string(reference.name));
       TEST_CHECK(service.extract(location(source), location(stale), {}, known));
@@ -2236,8 +2404,8 @@ esac
     TEST_CHECK(!service.error() && service.catalog());
     TEST_CHECK(service.openMember("small"));
     wait(service, pump);
-    const auto opened = service.takeOpenedFile();
-    TEST_CHECK(!service.error() && opened && read(*opened->nativePath()) == "abc");
+    const auto opened = service.takeOpenedMember();
+    TEST_CHECK(!service.error() && opened && read(*opened->location.nativePath()) == "abc");
     service.shutdown();
     wait(service, pump);
     TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
@@ -2356,6 +2524,15 @@ esac
 } // namespace
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--nested-archives") {
+      Fixture fixture;
+      Pump pump;
+      testNestedArchives(fixture, pump);
+      testNestedArchiveBudget(fixture, pump);
+      testNestedArchivePasswords(fixture, pump);
+      std::println("nested archive checks passed");
+      return 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--search-only-ancestors") {
       testSearchOnlyAncestors();
       return 0;
@@ -2408,6 +2585,9 @@ int main(int argc, char** argv) {
     testCompressedTarFailures(fixture, pump);
     testCompressedPaddingLimit(fixture, pump);
     testRoundTrips(fixture, pump);
+    testNestedArchives(fixture, pump);
+    testNestedArchiveBudget(fixture, pump);
+    testNestedArchivePasswords(fixture, pump);
     testNativeJobCapacity(fixture);
     testLargeSparseMember(fixture);
     testLargeCatalogue(fixture);
