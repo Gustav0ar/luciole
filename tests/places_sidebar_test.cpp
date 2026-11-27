@@ -415,6 +415,15 @@ namespace {
              "Remote", "Network"}
         )
     );
+    // With no network shares, hiding Network also omits the empty Remote heading.
+    sidebar.setShowNetwork(false);
+    TEST_CHECK(
+        sidebarLabels(sidebar)
+        == std::vector<std::string>(
+            {"Places", "Home", "Trash", "Drives", "File System", "Debian ISO", "Backup.zip", "Games", "Arch ISO"}
+        )
+    );
+    sidebar.setShowNetwork(true);
 
     // No-op drive-changed does not trigger a rebuild; changing drive capability moves the row into Removable.
     currentVolumes.push_back(usbDrive.get());
@@ -463,23 +472,19 @@ namespace {
         )
     );
 
-    // Show Drives hides Drives and Removable; Remote (Network + shares) stays visible.
+    // Show Drives hides Drives, Removable, and remote shares; Remote still shows Network while Show Network is on.
     sidebar.setShowDrives(false);
-    TEST_CHECK(
-        sidebarLabels(sidebar)
-        == std::vector<std::string>(
-            {"Places", "Home", "Trash", "Remote", "Network", "Filmes", "TV", "Archive", "Cloud"}
-        )
-    );
-
-    // Show Network hides only Remote; Drives and Removable stay visible.
-    sidebar.setShowDrives(true);
+    TEST_CHECK(sidebarLabels(sidebar) == std::vector<std::string>({"Places", "Home", "Trash", "Remote", "Network"}));
     sidebar.setShowNetwork(false);
+    TEST_CHECK(sidebarLabels(sidebar) == std::vector<std::string>({"Places", "Home", "Trash"}));
+
+    // Show Network hides only Network; Drives, Removable, and remote shares stay visible under Show Drives.
+    sidebar.setShowDrives(true);
     TEST_CHECK(
         sidebarLabels(sidebar)
         == std::vector<std::string>(
             {"Places", "Home", "Trash", "Drives", "File System", "Backup.zip", "Games", "Arch ISO", "Removable",
-             "USB Drive", "Phone", "SD Card"}
+             "USB Drive", "Phone", "SD Card", "Remote", "Filmes", "TV", "Archive", "Cloud"}
         )
     );
 
@@ -493,12 +498,15 @@ namespace {
         )
     );
     sidebar.setShowDrives(false);
-    TEST_CHECK(sidebarLabels(sidebar) == std::vector<std::string>({"Folders", "Home", "Trash", "Network", "Filmes"}));
-    sidebar.setShowDrives(true);
+    TEST_CHECK(sidebarLabels(sidebar) == std::vector<std::string>({"Folders", "Home", "Trash", "Network"}));
     sidebar.setShowNetwork(false);
+    TEST_CHECK(sidebarLabels(sidebar) == std::vector<std::string>({"Folders", "Home", "Trash"}));
+    sidebar.setShowDrives(true);
     TEST_CHECK(
         sidebarLabels(sidebar)
-        == std::vector<std::string>({"Folders", "Home", "Trash", "File System", "Backup.zip", "USB Drive", "Phone"})
+        == std::vector<std::string>(
+            {"Folders", "Home", "Trash", "File System", "Backup.zip", "USB Drive", "Phone", "Filmes"}
+        )
     );
   }
 } // namespace

@@ -128,14 +128,11 @@ void luciole::PlacesSidebar::setDriveContextCallback(std::function<void(const st
   m_driveContext = std::move(callback);
 }
 const luciole::Drive* luciole::PlacesSidebar::driveAt(const Location& root) const {
-  if (m_pins.contains(root)) {
+  if (!m_showDrives || m_pins.contains(root)) {
     return nullptr;
   }
   const auto& drives = m_drives.drives();
   const auto found = std::ranges::find_if(drives, [&](const Drive& drive) {
-    if (!(drive.kind == DriveKind::Network ? m_showNetwork : m_showDrives)) {
-      return false;
-    }
     const auto& target = drive.activation ? drive.activation : drive.root;
     return target == root;
   });
@@ -637,13 +634,12 @@ void luciole::PlacesSidebar::rebuild() {
     }
     // Explicit expansion can activate an idle system automount through DirectorySession.
     std::vector<Drive> drives;
-    std::ranges::copy_if(m_drives.drives(), std::back_inserter(drives), [this](const Drive& drive) {
-      if (!(drive.kind == DriveKind::Network ? m_showNetwork : m_showDrives)) {
-        return false;
-      }
-      const auto& target = drive.activation ? drive.activation : drive.root;
-      return target && !m_pins.contains(*target);
-    });
+    if (m_showDrives) {
+      std::ranges::copy_if(m_drives.drives(), std::back_inserter(drives), [this](const Drive& drive) {
+        const auto& target = drive.activation ? drive.activation : drive.root;
+        return target && !m_pins.contains(*target);
+      });
+    }
     m_tree->setRoots(m_pins, drives, m_showNetwork, m_trashFull);
     m_tree->sync(m_current, m_showHidden);
     return;
@@ -718,17 +714,27 @@ void luciole::PlacesSidebar::rebuild() {
     addDriveSection("Drives", DriveKind::Local);
     addDriveSection("Removable", DriveKind::Removable);
   }
+  bool remoteHeading = false;
+  const auto ensureRemoteHeading = [&] {
+    if (!remoteHeading) {
+      addSectionHeading("Remote");
+      remoteHeading = true;
+    }
+  };
   if (m_showNetwork) {
-    addSectionHeading("Remote");
+    ensureRemoteHeading();
     addRow({.label = "Network", .location = Location::network(), .iconName = {}}, "network", std::nullopt);
+  }
+  if (m_showDrives) {
     for (const auto& drive : m_drives.drives()) {
       if (drive.kind == DriveKind::Network) {
+        ensureRemoteHeading();
         addDriveRow(drive);
       }
     }
   }
   if (!m_driveRows.empty()) {
-    m_drives.refreshUsage(m_showDrives, m_showNetwork);
+    m_drives.refreshUsage();
   }
   sync(m_current);
 }

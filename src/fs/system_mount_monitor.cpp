@@ -19,7 +19,6 @@ struct luciole::SystemMountMonitor::State : std::enable_shared_from_this<State> 
   std::vector<MountedFilesystem> mounted;
   std::vector<ConfiguredFilesystem> configured;
   std::function<void()> changed;
-  bool ready = false;
   bool pending = false;
   bool dirty = false;
 
@@ -115,8 +114,6 @@ struct luciole::SystemMountMonitor::State : std::enable_shared_from_this<State> 
             return;
           }
           state->pending = false;
-          bool notify = !state->ready;
-          state->ready = true;
           if (reply) {
             state->subscribed = reply->subscribed;
             if (reply->native) {
@@ -135,11 +132,10 @@ struct luciole::SystemMountMonitor::State : std::enable_shared_from_this<State> 
               state->mounts = std::move(reply->mounts);
               state->mounted = std::move(reply->mounted);
               state->configured = std::move(reply->configured);
-              notify = true;
+              if (state->changed) {
+                state->changed();
+              }
             }
-          }
-          if (notify && state->changed) {
-            state->changed();
           }
           if (state->dirty && !state->token.cancelled()) {
             state->refresh();
@@ -186,5 +182,3 @@ const std::vector<luciole::MountedFilesystem>& luciole::SystemMountMonitor::moun
 const std::vector<luciole::ConfiguredFilesystem>& luciole::SystemMountMonitor::configuredFilesystems() const {
   return m_state->configured;
 }
-
-bool luciole::SystemMountMonitor::ready() const { return m_state->ready; }

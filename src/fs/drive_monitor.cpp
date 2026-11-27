@@ -130,81 +130,6 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
   std::function<void()> changed;
   std::function<void()> usageChanged;
   std::set<std::string> usagePending;
-  std::optional<std::pair<bool, bool>> deferredUsage;
-
-  bool awaitingClassification(const Drive& drive) const {
-    if (drive.key == "root" || drive.kind == DriveKind::Network || !drive.root || !drive.root->isNative()) {
-      return false;
-    }
-    const auto handle = handles.find(drive.key);
-    if (handle != handles.end() && handle->second.device) {
-      return false;
-    }
-    if (!systemMounts.ready()) {
-      return true;
-    }
-    const auto path = drive.root->nativePath();
-    return path && mountedFilesystemAt(*path, systemMounts.mountedFilesystems()) == nullptr;
-  }
-
-  void refreshUsage(bool includeLocal, bool includeNetwork) {
-    struct Request {
-      std::weak_ptr<State> state;
-      std::string key;
-      Location root;
-    };
-    const auto finished = [](GObject* source, GAsyncResult* result, gpointer data) {
-      const std::unique_ptr<Request> request(static_cast<Request*>(data));
-      GError* error = nullptr;
-      const GioPtr<GFileInfo> info(g_file_query_filesystem_info_finish(G_FILE(source), result, &error));
-      (void)errorText(error);
-      const auto state = request->state.lock();
-      if (!state) {
-        return;
-      }
-      state->usagePending.erase(request->key);
-      std::optional<DriveUsage> usage;
-      if (info) {
-        const auto size = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_SIZE);
-        auto used = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_USED);
-        if (const auto free = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
-            !used && size && free && *free <= *size) {
-          used = *size - *free;
-        }
-        if (size && *size > 0 && used) {
-          usage = DriveUsage{.used = std::min(*used, *size), .size = *size};
-        }
-      }
-      const auto drive = std::ranges::find_if(state->drives, [&](const Drive& candidate) {
-        return candidate.key == request->key && candidate.root == request->root;
-      });
-      if (drive == state->drives.end() || drive->usage == usage) {
-        return;
-      }
-      drive->usage = usage;
-      if (state->usageChanged) {
-        state->usageChanged();
-      }
-    };
-    for (const auto& drive : drives) {
-      if (drive.activation || !drive.root) {
-        continue;
-      }
-      if (awaitingClassification(drive)) {
-        deferredUsage = {includeLocal, includeNetwork};
-        continue;
-      }
-      if ((drive.kind == DriveKind::Network ? !includeNetwork : !includeLocal)
-          || !usagePending.insert(drive.key).second) {
-        continue;
-      }
-      g_file_query_filesystem_info_async(
-          gioFile(*drive.root).get(),
-          G_FILE_ATTRIBUTE_FILESYSTEM_SIZE "," G_FILE_ATTRIBUTE_FILESYSTEM_USED "," G_FILE_ATTRIBUTE_FILESYSTEM_FREE,
-          G_PRIORITY_DEFAULT, nullptr, finished, new Request{shared_from_this(), drive.key, *drive.root}
-      );
-    }
-  }
 
   // "/" leads the list as File System; GIO's volume monitor never reports it.
   void addRoot() {
@@ -432,11 +357,7 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
       }
     }
     if (drives != previous && changed) {
-      deferredUsage.reset();
       changed();
-    } else if (systemMounts.ready() && deferredUsage) {
-      const auto [includeLocal, includeNetwork] = *std::exchange(deferredUsage, std::nullopt);
-      refreshUsage(includeLocal, includeNetwork);
     }
   }
 };
@@ -499,8 +420,55 @@ void luciole::DriveMonitor::setUsageChangedCallback(std::function<void()> callba
   m_state->usageChanged = std::move(callback);
 }
 
-void luciole::DriveMonitor::refreshUsage(bool includeLocal, bool includeNetwork) {
-  m_state->refreshUsage(includeLocal, includeNetwork);
+void luciole::DriveMonitor::refreshUsage() {
+  struct Request {
+    std::weak_ptr<State> state;
+    std::string key;
+    Location root;
+  };
+  const auto finished = [](GObject* source, GAsyncResult* result, gpointer data) {
+    const std::unique_ptr<Request> request(static_cast<Request*>(data));
+    GError* error = nullptr;
+    const GioPtr<GFileInfo> info(g_file_query_filesystem_info_finish(G_FILE(source), result, &error));
+    (void)errorText(error);
+    const auto state = request->state.lock();
+    if (!state) {
+      return;
+    }
+    state->usagePending.erase(request->key);
+    std::optional<DriveUsage> usage;
+    if (info) {
+      const auto size = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_SIZE);
+      auto used = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_USED);
+      if (const auto free = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
+          !used && size && free && *free <= *size) {
+        used = *size - *free;
+      }
+      if (size && *size > 0 && used) {
+        usage = DriveUsage{.used = std::min(*used, *size), .size = *size};
+      }
+    }
+    const auto drive = std::ranges::find_if(state->drives, [&](const Drive& candidate) {
+      return candidate.key == request->key && candidate.root == request->root;
+    });
+    if (drive == state->drives.end() || drive->usage == usage) {
+      return;
+    }
+    drive->usage = usage;
+    if (state->usageChanged) {
+      state->usageChanged();
+    }
+  };
+  for (const auto& drive : m_state->drives) {
+    if (drive.activation || !drive.root || !m_state->usagePending.insert(drive.key).second) {
+      continue;
+    }
+    g_file_query_filesystem_info_async(
+        gioFile(*drive.root).get(),
+        G_FILE_ATTRIBUTE_FILESYSTEM_SIZE "," G_FILE_ATTRIBUTE_FILESYSTEM_USED "," G_FILE_ATTRIBUTE_FILESYSTEM_FREE,
+        G_PRIORITY_DEFAULT, nullptr, finished, new Request{m_state, drive.key, *drive.root}
+    );
+  }
 }
 
 void luciole::DriveMonitor::mount(

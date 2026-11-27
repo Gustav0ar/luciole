@@ -261,10 +261,10 @@ void luciole::SidebarTreeView::setRoots(
   }
   if (showNetwork) {
     addRoot(Location::network(), "Network", "network");
-    for (const auto& drive : drives) {
-      if (drive.kind == DriveKind::Network) {
-        addDriveRoot(drive);
-      }
+  }
+  for (const auto& drive : drives) {
+    if (drive.kind == DriveKind::Network) {
+      addDriveRoot(drive);
     }
   }
   snapshot.entries = std::move(entries);

@@ -95,8 +95,8 @@ namespace luciole {
     const std::vector<Drive>& drives() const;
     const Drive* find(const std::string& key) const;
     void setChangedCallback(std::function<void()> callback);
-    // Re-queries usage of mounted drives in the requested groups asynchronously; queries in flight are skipped.
-    void refreshUsage(bool includeLocal = true, bool includeNetwork = true);
+    // Re-queries usage of every mounted drive asynchronously; a drive with a query in flight is skipped.
+    void refreshUsage();
     // Runs on the main context when a drive's usage changes. Must not throw.
     void setUsageChangedCallback(std::function<void()> callback);
     // Mounts the drive if needed; done receives the root, or an error message.

@@ -42,11 +42,11 @@ Choose **Change Icon…** in a bookmark's context menu and pick a [Tabler icon](
 
 ## Show or hide Network
 
-In the flat sidebar, the **Remote** section starts with **Network**, followed by mounted and configured network shares. In the folder tree, **Network**, mounted shares and configured system automounts appear at the end of **Folders**. **Settings → Appearance → Sidebar → Show Network** or Network's **Hide Network** menu item hides or restores these remote entries in both sidebar modes. See [network folders](network.md).
+In the flat sidebar, the **Remote** section lists **Network** followed by mounted and configured network shares, and appears whenever it has at least one row. In the folder tree, **Network**, mounted shares and configured system automounts appear at the end of **Folders**. **Settings → Appearance → Sidebar → Show Network** or Network's **Hide Network** menu item hides or restores **Network** in both sidebar modes while keeping mounted and configured shares visible. See [network folders](network.md).
 
 ## Use Drives
 
-In the flat sidebar, **Drives** starts with File System (`/`), followed by internal partitions and other local volumes. Attached USB drives, SD cards, phones, cameras and optical media appear in a separate **Removable** section below **Drives** whenever one or more are connected. The folder tree lists mounted local and removable drives under **Folders** without section headings. System mounts such as `/home` and bind mounts are not listed.
+In the flat sidebar, **Drives** starts with File System (`/`), followed by internal partitions and other local volumes. Attached USB drives, SD cards, phones, cameras and optical media appear in a separate **Removable** section below **Drives** whenever one or more are connected, and mounted or configured network shares appear under **Remote**. **Settings → Appearance → Sidebar → Show Drives** controls all drive, removable and share rows. The folder tree lists mounted drives and configured system automounts under **Folders** without section headings. System mounts such as `/home` and bind mounts are not listed.
 
 A mounted drive shows a bar of used space under its row, red at 90% used or more. Unmounted drives and filesystems that report no size have no bar. Hovering a mounted drive shows its mountpoint and free space.
 

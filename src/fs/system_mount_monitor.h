@@ -17,7 +17,6 @@ namespace luciole {
     const std::vector<SystemMount>& mounts() const;
     const std::vector<MountedFilesystem>& mountedFilesystems() const;
     const std::vector<ConfiguredFilesystem>& configuredFilesystems() const;
-    bool ready() const;
 
   private:
     struct State;
