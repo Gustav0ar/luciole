@@ -14,6 +14,7 @@
 #include <gio/gunixmounts.h>
 #include <map>
 #include <set>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -26,13 +27,49 @@ namespace {
   };
 
   std::string identifier(GVolume* volume) {
-    for (const auto* kind : {G_VOLUME_IDENTIFIER_KIND_UUID, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE}) {
+    for (const auto* kind :
+         {G_VOLUME_IDENTIFIER_KIND_UUID, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE, G_VOLUME_IDENTIFIER_KIND_NFS_MOUNT}) {
       if (const luciole::GString value(g_volume_get_identifier(volume, kind)); value) {
         return value.get();
       }
     }
     const luciole::GString name(g_volume_get_name(volume));
     return name ? name.get() : "";
+  }
+
+  std::string_view uriScheme(const luciole::Location& location) {
+    const char* scheme = g_uri_peek_scheme(location.uri().c_str());
+    return scheme != nullptr ? std::string_view(scheme) : std::string_view{};
+  }
+
+  bool removableDeviceScheme(std::string_view scheme) {
+    return scheme == "mtp" || scheme == "gphoto2" || scheme == "afc" || scheme == "cdda" || scheme == "burn";
+  }
+
+  bool localNonNativeScheme(std::string_view scheme) {
+    return removableDeviceScheme(scheme)
+        || scheme == "archive"
+        || scheme == "admin"
+        || scheme == "computer"
+        || scheme == "trash"
+        || scheme == "recent"
+        || scheme == "localtest";
+  }
+
+  bool isRemovableDrive(GDrive* drive) {
+    if (drive == nullptr) {
+      return false;
+    }
+    if (g_drive_is_removable(drive) != FALSE || g_drive_can_stop(drive) != FALSE) {
+      return true;
+    }
+    const auto* iface = G_DRIVE_GET_IFACE(drive);
+    return (iface->is_media_removable != nullptr && g_drive_is_media_removable(drive) != FALSE)
+        || (iface->can_eject != nullptr && g_drive_can_eject(drive) != FALSE);
+  }
+
+  bool canEjectVolume(GVolume* volume) {
+    return volume != nullptr && G_VOLUME_GET_IFACE(volume)->can_eject != nullptr && g_volume_can_eject(volume) != FALSE;
   }
 
   std::string errorText(GError* error) {
@@ -93,6 +130,81 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
   std::function<void()> changed;
   std::function<void()> usageChanged;
   std::set<std::string> usagePending;
+  std::optional<std::pair<bool, bool>> deferredUsage;
+
+  bool awaitingClassification(const Drive& drive) const {
+    if (drive.key == "root" || drive.kind == DriveKind::Network || !drive.root || !drive.root->isNative()) {
+      return false;
+    }
+    const auto handle = handles.find(drive.key);
+    if (handle != handles.end() && handle->second.device) {
+      return false;
+    }
+    if (!systemMounts.ready()) {
+      return true;
+    }
+    const auto path = drive.root->nativePath();
+    return path && mountedFilesystemAt(*path, systemMounts.mountedFilesystems()) == nullptr;
+  }
+
+  void refreshUsage(bool includeLocal, bool includeNetwork) {
+    struct Request {
+      std::weak_ptr<State> state;
+      std::string key;
+      Location root;
+    };
+    const auto finished = [](GObject* source, GAsyncResult* result, gpointer data) {
+      const std::unique_ptr<Request> request(static_cast<Request*>(data));
+      GError* error = nullptr;
+      const GioPtr<GFileInfo> info(g_file_query_filesystem_info_finish(G_FILE(source), result, &error));
+      (void)errorText(error);
+      const auto state = request->state.lock();
+      if (!state) {
+        return;
+      }
+      state->usagePending.erase(request->key);
+      std::optional<DriveUsage> usage;
+      if (info) {
+        const auto size = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_SIZE);
+        auto used = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_USED);
+        if (const auto free = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
+            !used && size && free && *free <= *size) {
+          used = *size - *free;
+        }
+        if (size && *size > 0 && used) {
+          usage = DriveUsage{.used = std::min(*used, *size), .size = *size};
+        }
+      }
+      const auto drive = std::ranges::find_if(state->drives, [&](const Drive& candidate) {
+        return candidate.key == request->key && candidate.root == request->root;
+      });
+      if (drive == state->drives.end() || drive->usage == usage) {
+        return;
+      }
+      drive->usage = usage;
+      if (state->usageChanged) {
+        state->usageChanged();
+      }
+    };
+    for (const auto& drive : drives) {
+      if (drive.activation || !drive.root) {
+        continue;
+      }
+      if (awaitingClassification(drive)) {
+        deferredUsage = {includeLocal, includeNetwork};
+        continue;
+      }
+      if ((drive.kind == DriveKind::Network ? !includeNetwork : !includeLocal)
+          || !usagePending.insert(drive.key).second) {
+        continue;
+      }
+      g_file_query_filesystem_info_async(
+          gioFile(*drive.root).get(),
+          G_FILE_ATTRIBUTE_FILESYSTEM_SIZE "," G_FILE_ATTRIBUTE_FILESYSTEM_USED "," G_FILE_ATTRIBUTE_FILESYSTEM_FREE,
+          G_PRIORITY_DEFAULT, nullptr, finished, new Request{shared_from_this(), drive.key, *drive.root}
+      );
+    }
+  }
 
   // "/" leads the list as File System; GIO's volume monitor never reports it.
   void addRoot() {
@@ -140,6 +252,49 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
         drive.key = "mount:" + drive.root->uri();
       }
     }
+    const GString volumeClass(
+        handle.volume ? g_volume_get_identifier(handle.volume.get(), G_VOLUME_IDENTIFIER_KIND_CLASS) : nullptr
+    );
+    const GString unixDevice(
+        handle.volume ? g_volume_get_identifier(handle.volume.get(), G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE) : nullptr
+    );
+    const GString nfsMount(
+        handle.volume ? g_volume_get_identifier(handle.volume.get(), G_VOLUME_IDENTIFIER_KIND_NFS_MOUNT) : nullptr
+    );
+    const std::string_view classValue = nfsMount ? std::string_view("network")
+        : volumeClass                            ? std::string_view(volumeClass.get())
+                                                 : std::string_view{};
+    std::optional<Location> target = drive.root;
+    if (!target && handle.volume) {
+      if (const GioPtr<GFile> activation(g_volume_get_activation_root(handle.volume.get())); activation) {
+        target = locationFromFile(activation.get());
+      }
+    }
+    const auto nativePath = target && target->isNative() ? target->nativePath() : std::nullopt;
+    const MountedFilesystem* mountedEntry =
+        nativePath ? mountedFilesystemAt(*nativePath, systemMounts.mountedFilesystems()) : nullptr;
+    const ConfiguredFilesystem* configuredEntry = !mountedEntry && device == nullptr
+        ? configuredFilesystemFor(
+              nativePath ? std::string_view(*nativePath) : std::string_view{},
+              unixDevice ? std::string_view(unixDevice.get()) : std::string_view{}, drive.label,
+              systemMounts.configuredFilesystems()
+          )
+        : nullptr;
+    drive.kind = classifyDrive({
+        .volumeClass = classValue,
+        .uriScheme = target && !target->isNative() ? uriScheme(*target) : std::string_view{},
+        .filesystemType = mountedEntry ? std::string_view(mountedEntry->type)
+            : configuredEntry          ? std::string_view(configuredEntry->type)
+                                       : std::string_view{},
+        .deviceSource = mountedEntry ? std::string_view(mountedEntry->source)
+            : unixDevice             ? std::string_view(unixDevice.get())
+            : configuredEntry        ? std::string_view(configuredEntry->source)
+                                     : std::string_view{},
+        .hasDevice = device != nullptr,
+        .removable = isRemovableDrive(device)
+            || canEjectVolume(handle.volume.get())
+            || (mount != nullptr && g_mount_can_eject(mount) != FALSE),
+    });
     const luciole::GioPtr<GIcon> icon(
         handle.volume ? g_volume_get_symbolic_icon(handle.volume.get())
                       : (mount ? g_mount_get_symbolic_icon(mount) : nullptr)
@@ -148,9 +303,9 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
     const auto kind = deviceGlyph(iconName);
     if (!kind.empty()) {
       drive.glyph = kind;
-    } else if (drive.root && !drive.root->isNative()) {
+    } else if (drive.kind == DriveKind::Network) {
       drive.glyph = "server";
-    } else if (device && g_drive_is_removable(device)) {
+    } else if (drive.kind == DriveKind::Removable) {
       drive.glyph = "device-usb";
     } else {
       drive.glyph = "database";
@@ -191,20 +346,29 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
         }
         continue;
       }
-      const GString kind(g_volume_get_identifier(volume.get(), G_VOLUME_IDENTIFIER_KIND_CLASS));
       const GString device(g_volume_get_identifier(volume.get(), G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE));
+      const GString nfsMount(g_volume_get_identifier(volume.get(), G_VOLUME_IDENTIFIER_KIND_NFS_MOUNT));
       const GioPtr<GFile> activation(g_volume_get_activation_root(volume.get()));
-      // Unmounted GVfs fstab network volumes expose no path or device identifier, only their display label.
-      const bool matchesSource = device && std::ranges::any_of(systemMounts.mounts(), [&](const auto& candidate) {
-                                   return sameMountSource(candidate.configuration.source, device.get());
-                                 });
+      const GioPtr<GDrive> volumeDrive(g_volume_get_drive(volume.get()));
+      // Unmounted GVfs fstab network volumes and GLib Unix nfs4 volumes expose no path or device identifier,
+      // only their display label; GLib Unix nfs volumes report their source under NFS_MOUNT.
+      const auto matchesConfiguredSource = [&](const char* source) {
+        return source != nullptr && std::ranges::any_of(systemMounts.mounts(), [&](const auto& candidate) {
+                 return sameMountSource(candidate.configuration.source, source);
+               });
+      };
+      const bool matchesSource = matchesConfiguredSource(device.get()) || matchesConfiguredSource(nfsMount.get());
       const GString name(g_volume_get_name(volume.get()));
       const bool matchesUnmountedNetwork = !activation
-          && kind
-          && std::string_view(kind.get()) == "network"
+          && !volumeDrive
+          && !device
+          && !nfsMount
           && name
-          && std::ranges::any_of(systemMounts.mounts(), [&](const auto& candidate) {
-               return candidate.label == name.get();
+          && std::ranges::any_of(
+              systemMounts.mounts(), [&](const auto& candidate) { return candidate.label == name.get(); }
+          )
+          && !std::ranges::any_of(systemMounts.configuredFilesystems(), [&](const auto& entry) {
+               return entry.label == name.get() && !networkMountType(entry.type);
              });
       if (matchesSource || matchesUnmountedNetwork) {
         continue;
@@ -253,11 +417,13 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
            .removal = removable ? DriveRemoval::Unmount : DriveRemoval::None,
            .usage = std::nullopt,
            .activation = mount.configuration.automount ? std::optional(target) : std::nullopt,
-           .iconName = {}}
+           .iconName = {},
+           .kind = DriveKind::Network}
       );
     }
-    // Mounted drives first, keeping GIO's order within each group; the root entry stays at the top.
+    // Mounted entries first within each category, ordered Local -> Removable -> Network; root stays at the top.
     std::ranges::stable_partition(drives, [](const Drive& drive) { return drive.root.has_value(); });
+    std::ranges::stable_sort(drives, {}, [](const Drive& drive) { return static_cast<std::uint8_t>(drive.kind); });
     // Keep the last known usage until the next query answers, so bars do not flicker on rebuilds.
     for (auto& drive : drives) {
       const auto old = std::ranges::find(previous, drive.key, &Drive::key);
@@ -265,8 +431,12 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
         drive.usage = old->usage;
       }
     }
-    if (changed) {
+    if (drives != previous && changed) {
+      deferredUsage.reset();
       changed();
+    } else if (systemMounts.ready() && deferredUsage) {
+      const auto [includeLocal, includeNetwork] = *std::exchange(deferredUsage, std::nullopt);
+      refreshUsage(includeLocal, includeNetwork);
     }
   }
 };
@@ -295,7 +465,8 @@ void luciole::DriveMonitor::start() {
   }
   m_state->monitor.reset(g_volume_monitor_get());
   for (const auto* signal :
-       {"volume-added", "volume-removed", "volume-changed", "mount-added", "mount-removed", "mount-changed"}) {
+       {"volume-added", "volume-removed", "volume-changed", "mount-added", "mount-removed", "mount-changed",
+        "drive-changed"}) {
     g_signal_connect_swapped(
         m_state->monitor.get(), signal, G_CALLBACK(+[](gpointer data) { static_cast<State*>(data)->refresh(); }),
         m_state.get()
@@ -328,55 +499,8 @@ void luciole::DriveMonitor::setUsageChangedCallback(std::function<void()> callba
   m_state->usageChanged = std::move(callback);
 }
 
-void luciole::DriveMonitor::refreshUsage() {
-  struct Request {
-    std::weak_ptr<State> state;
-    std::string key;
-    Location root;
-  };
-  const auto finished = [](GObject* source, GAsyncResult* result, gpointer data) {
-    const std::unique_ptr<Request> request(static_cast<Request*>(data));
-    GError* error = nullptr;
-    const GioPtr<GFileInfo> info(g_file_query_filesystem_info_finish(G_FILE(source), result, &error));
-    (void)errorText(error);
-    const auto state = request->state.lock();
-    if (!state) {
-      return;
-    }
-    state->usagePending.erase(request->key);
-    std::optional<DriveUsage> usage;
-    if (info) {
-      const auto size = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_SIZE);
-      auto used = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_USED);
-      if (const auto free = infoUint64(info.get(), G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
-          !used && size && free && *free <= *size) {
-        used = *size - *free;
-      }
-      if (size && *size > 0 && used) {
-        usage = DriveUsage{.used = std::min(*used, *size), .size = *size};
-      }
-    }
-    const auto drive = std::ranges::find_if(state->drives, [&](const Drive& candidate) {
-      return candidate.key == request->key && candidate.root == request->root;
-    });
-    if (drive == state->drives.end() || drive->usage == usage) {
-      return;
-    }
-    drive->usage = usage;
-    if (state->usageChanged) {
-      state->usageChanged();
-    }
-  };
-  for (const auto& drive : m_state->drives) {
-    if (drive.activation || !drive.root || !m_state->usagePending.insert(drive.key).second) {
-      continue;
-    }
-    g_file_query_filesystem_info_async(
-        gioFile(*drive.root).get(),
-        G_FILE_ATTRIBUTE_FILESYSTEM_SIZE "," G_FILE_ATTRIBUTE_FILESYSTEM_USED "," G_FILE_ATTRIBUTE_FILESYSTEM_FREE,
-        G_PRIORITY_DEFAULT, nullptr, finished, new Request{m_state, drive.key, *drive.root}
-    );
-  }
+void luciole::DriveMonitor::refreshUsage(bool includeLocal, bool includeNetwork) {
+  m_state->refreshUsage(includeLocal, includeNetwork);
 }
 
 void luciole::DriveMonitor::mount(
@@ -487,6 +611,26 @@ void luciole::DriveMonitor::remove(const std::string& key, std::function<void(Dr
     );
     break;
   }
+}
+
+luciole::DriveKind luciole::classifyDrive(const DriveClassification& input) {
+  if (input.volumeClass == "network") {
+    return DriveKind::Network;
+  }
+  if (input.volumeClass == "loop" || input.deviceSource.starts_with("/dev/loop")) {
+    return DriveKind::Local;
+  }
+  if (!input.hasDevice
+      && ((!input.uriScheme.empty() && !localNonNativeScheme(input.uriScheme))
+          || networkFilesystemType(input.filesystemType))) {
+    return DriveKind::Network;
+  }
+  if (input.removable
+      || removableDeviceScheme(input.uriScheme)
+      || (!input.hasDevice && removableFilesystemType(input.filesystemType))) {
+    return DriveKind::Removable;
+  }
+  return DriveKind::Local;
 }
 
 std::string_view luciole::deviceGlyph(std::string_view iconName) {

@@ -16,7 +16,10 @@ struct luciole::SystemMountMonitor::State : std::enable_shared_from_this<State> 
   bool subscribed = false;
   CancelToken token;
   std::vector<SystemMount> mounts;
+  std::vector<MountedFilesystem> mounted;
+  std::vector<ConfiguredFilesystem> configured;
   std::function<void()> changed;
+  bool ready = false;
   bool pending = false;
   bool dirty = false;
 
@@ -85,6 +88,8 @@ struct luciole::SystemMountMonitor::State : std::enable_shared_from_this<State> 
       bool subscribed;
       std::optional<std::vector<MountConfiguration>> native;
       std::vector<SystemMount> mounts;
+      std::vector<MountedFilesystem> mounted;
+      std::vector<ConfiguredFilesystem> configured;
     };
     runJob<Reply>(
         token,
@@ -99,7 +104,9 @@ struct luciole::SystemMountMonitor::State : std::enable_shared_from_this<State> 
           reply.native = readSystemdMounts(reply.bus.get(), token, &reply.subscribed);
           auto configuration =
               reply.native ? mergeMountConfiguration(readFstabMounts(), *reply.native) : configuredSystemMounts();
-          reply.mounts = systemMounts(configuration, readMountedFilesystems(), g_get_home_dir(), g_get_user_name());
+          reply.mounted = readMountedFilesystems();
+          reply.configured = readConfiguredFilesystems();
+          reply.mounts = systemMounts(configuration, reply.mounted, g_get_home_dir(), g_get_user_name());
           return reply;
         },
         [weak = weak_from_this()](JobResult<Reply> reply) {
@@ -108,6 +115,8 @@ struct luciole::SystemMountMonitor::State : std::enable_shared_from_this<State> 
             return;
           }
           state->pending = false;
+          bool notify = !state->ready;
+          state->ready = true;
           if (reply) {
             state->subscribed = reply->subscribed;
             if (reply->native) {
@@ -120,12 +129,17 @@ struct luciole::SystemMountMonitor::State : std::enable_shared_from_this<State> 
               // Cover unit changes between the first snapshot and attaching the signal handler.
               state->dirty = true;
             }
-            if (state->mounts != reply->mounts) {
+            if (state->mounts != reply->mounts
+                || state->mounted != reply->mounted
+                || state->configured != reply->configured) {
               state->mounts = std::move(reply->mounts);
-              if (state->changed) {
-                state->changed();
-              }
+              state->mounted = std::move(reply->mounted);
+              state->configured = std::move(reply->configured);
+              notify = true;
             }
+          }
+          if (notify && state->changed) {
+            state->changed();
           }
           if (state->dirty && !state->token.cancelled()) {
             state->refresh();
@@ -164,3 +178,13 @@ void luciole::SystemMountMonitor::start(std::function<void()> changed) {
 }
 
 const std::vector<luciole::SystemMount>& luciole::SystemMountMonitor::mounts() const { return m_state->mounts; }
+
+const std::vector<luciole::MountedFilesystem>& luciole::SystemMountMonitor::mountedFilesystems() const {
+  return m_state->mounted;
+}
+
+const std::vector<luciole::ConfiguredFilesystem>& luciole::SystemMountMonitor::configuredFilesystems() const {
+  return m_state->configured;
+}
+
+bool luciole::SystemMountMonitor::ready() const { return m_state->ready; }

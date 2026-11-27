@@ -128,11 +128,14 @@ void luciole::PlacesSidebar::setDriveContextCallback(std::function<void(const st
   m_driveContext = std::move(callback);
 }
 const luciole::Drive* luciole::PlacesSidebar::driveAt(const Location& root) const {
-  if (!m_showDrives || m_pins.contains(root)) {
+  if (m_pins.contains(root)) {
     return nullptr;
   }
   const auto& drives = m_drives.drives();
   const auto found = std::ranges::find_if(drives, [&](const Drive& drive) {
+    if (!(drive.kind == DriveKind::Network ? m_showNetwork : m_showDrives)) {
+      return false;
+    }
     const auto& target = drive.activation ? drive.activation : drive.root;
     return target == root;
   });
@@ -464,7 +467,7 @@ std::optional<std::size_t> luciole::PlacesSidebar::separatorTarget(float y) cons
     }
   }
   // Its own gap has a separator too: the one being dragged.
-  return target && SeparatorGaps(m_pins, m_showNetwork).free(*target) ? target : std::nullopt;
+  return target && SeparatorGaps(m_pins).free(*target) ? target : std::nullopt;
 }
 void luciole::PlacesSidebar::showSeparatorIndicator(std::optional<std::size_t> target) {
   if (m_separatorIndicator == nullptr) {
@@ -634,12 +637,13 @@ void luciole::PlacesSidebar::rebuild() {
     }
     // Explicit expansion can activate an idle system automount through DirectorySession.
     std::vector<Drive> drives;
-    if (m_showDrives) {
-      std::ranges::copy_if(m_drives.drives(), std::back_inserter(drives), [this](const Drive& drive) {
-        const auto& target = drive.activation ? drive.activation : drive.root;
-        return target && !m_pins.contains(*target);
-      });
-    }
+    std::ranges::copy_if(m_drives.drives(), std::back_inserter(drives), [this](const Drive& drive) {
+      if (!(drive.kind == DriveKind::Network ? m_showNetwork : m_showDrives)) {
+        return false;
+      }
+      const auto& target = drive.activation ? drive.activation : drive.root;
+      return target && !m_pins.contains(*target);
+    });
     m_tree->setRoots(m_pins, drives, m_showNetwork, m_trashFull);
     m_tree->sync(m_current, m_showHidden);
     return;
@@ -674,11 +678,8 @@ void luciole::PlacesSidebar::rebuild() {
   m_separatorDrag.reset();
   content->addChild(makeListDropIndicator(1.0F, &m_separatorIndicator));
   const auto& pins = m_pins.bookmarks();
-  const SeparatorGaps gaps(m_pins, m_showNetwork);
+  const SeparatorGaps gaps(m_pins);
   for (std::size_t i = 0; i < pins.size(); ++i) {
-    if (!placeShown(pins[i], m_showNetwork)) {
-      continue;
-    }
     const auto separator = gaps.separatorAbove(i);
     const auto line = separator ? addSeparatorRow(*separator) : SeparatorRow{};
     const auto known = std::ranges::find_if(m_pins.userPlaces(), [&](const auto& place) {
@@ -696,13 +697,38 @@ void luciole::PlacesSidebar::rebuild() {
     m_rows.back().separatorButton = line.button;
     m_rows.back().separatorLine = line.line;
   }
-  if (m_showDrives && !m_drives.drives().empty()) {
+  const auto addSectionHeading = [&](const std::string& title) {
     content->addChild(ui::column({.align = FlexAlign::Stretch, .paddingV = Style::spaceXs}, ui::separator({})));
-    heading("Drives");
+    heading(title);
+  };
+  const auto addDriveSection = [&](const std::string& title, DriveKind kind) {
+    bool added = false;
     for (const auto& drive : m_drives.drives()) {
+      if (drive.kind != kind) {
+        continue;
+      }
+      if (!added) {
+        addSectionHeading(title);
+        added = true;
+      }
       addDriveRow(drive);
     }
-    m_drives.refreshUsage();
+  };
+  if (m_showDrives) {
+    addDriveSection("Drives", DriveKind::Local);
+    addDriveSection("Removable", DriveKind::Removable);
+  }
+  if (m_showNetwork) {
+    addSectionHeading("Remote");
+    addRow({.label = "Network", .location = Location::network(), .iconName = {}}, "network", std::nullopt);
+    for (const auto& drive : m_drives.drives()) {
+      if (drive.kind == DriveKind::Network) {
+        addDriveRow(drive);
+      }
+    }
+  }
+  if (!m_driveRows.empty()) {
+    m_drives.refreshUsage(m_showDrives, m_showNetwork);
   }
   sync(m_current);
 }

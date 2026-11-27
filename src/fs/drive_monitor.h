@@ -38,6 +38,9 @@ namespace luciole {
     std::vector<DriveBlocker> blockers;
   };
 
+  // Sidebar grouping for a volume or mount.
+  enum class DriveKind : std::uint8_t { Local, Removable, Network };
+
   // The root filesystem ("/" as File System), then each mountable volume or mount reported by GIO's volume
   // monitor (removable media, extra partitions, network mounts), as Nautilus lists them under "Other Locations".
   struct Drive {
@@ -56,7 +59,21 @@ namespace luciole {
     // The GIO icon name, without "-symbolic", when it names no standard device kind. A udev rule can set it
     // through ID_MEDIA_PLAYER_ICON_NAME; the UI shows the glyph of that name, if any, in place of `glyph`.
     std::string iconName;
+    DriveKind kind = DriveKind::Local;
+    bool operator==(const Drive&) const = default;
   };
+
+  struct DriveClassification {
+    std::string_view volumeClass;
+    std::string_view uriScheme;
+    std::string_view filesystemType;
+    std::string_view deviceSource;
+    bool hasDevice = false;
+    bool removable = false;
+  };
+
+  // Classifies a volume or mount into Drives, Removable, or Remote.
+  DriveKind classifyDrive(const DriveClassification& input);
 
   // The glyph for a freedesktop device icon name such as "phone" or "camera-photo", tried with trailing
   // "-part"s removed so "phone-samsung-galaxy-s" maps as "phone". Empty for any other name.
@@ -74,12 +91,12 @@ namespace luciole {
     // monitor services, so the application calls it after its first frame. Idempotent.
     void start();
 
-    // The root filesystem, then mounted drives, then unmounted ones.
+    // Local drives, removable devices, then network shares; mounted entries lead each group and "/" stays first.
     const std::vector<Drive>& drives() const;
     const Drive* find(const std::string& key) const;
     void setChangedCallback(std::function<void()> callback);
-    // Re-queries usage of every mounted drive asynchronously; a drive with a query in flight is skipped.
-    void refreshUsage();
+    // Re-queries usage of mounted drives in the requested groups asynchronously; queries in flight are skipped.
+    void refreshUsage(bool includeLocal = true, bool includeNetwork = true);
     // Runs on the main context when a drive's usage changes. Must not throw.
     void setUsageChangedCallback(std::function<void()> callback);
     // Mounts the drive if needed; done receives the root, or an error message.

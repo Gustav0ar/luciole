@@ -844,6 +844,17 @@ namespace {
     c.pinned = [](const luciole::Location&) { return true; };
     TEST_CHECK(!R::state(A::Pin, c, folder).enabled && R::state(A::Unpin, c, folder).enabled);
     TEST_CHECK(!R::state(A::PinCurrent, c, folder).enabled && R::state(A::UnpinCurrent, c, folder).enabled);
+    auto networkFolder = folder;
+    networkFolder.folder = luciole::Location::network();
+    TEST_CHECK(
+        !R::state(A::PinCurrent, c, networkFolder).enabled && !R::state(A::UnpinCurrent, c, networkFolder).enabled
+    );
+    auto unpinned = c;
+    unpinned.pinned = [](const luciole::Location&) { return false; };
+    TEST_CHECK(
+        !R::state(A::PinCurrent, unpinned, networkFolder).enabled
+        && !R::state(A::UnpinCurrent, unpinned, networkFolder).enabled
+    );
     test::editEntries(data, [&](auto& entries) {
       for (auto& item : entries) {
         item.setIdentity(luciole::FileIdentity{"native", std::to_string(item.id)});

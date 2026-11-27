@@ -134,7 +134,7 @@ std::vector<ContextMenuControlEntry> MenuController::folderMenuEntries(const luc
   entries.back().label = "Sort";
   entries.back().hasSubmenu = true;
   add(Action::Refresh);
-  if (request.folder && !request.folder->isTrash()) {
+  if (request.folder && !request.folder->isTrash() && *request.folder != luciole::Location::network()) {
     add(m_pins.contains(*request.folder) ? Action::UnpinCurrent : Action::PinCurrent);
   }
   add(Action::ReloadPins);
@@ -407,7 +407,7 @@ void MenuController::openSeparatorMenu(std::size_t before, float x, float y) {
   }
   // The gap above or below the one this separator is drawn in, among the rows Places shows.
   const auto neighbor = [this, before](bool up) -> std::optional<std::size_t> {
-    const luciole::SeparatorGaps gaps(m_pins, m_page.settings().showNetwork);
+    const luciole::SeparatorGaps gaps(m_pins);
     const auto gap = gaps.gap(before);
     const auto target = !gap ? std::nullopt : up ? gaps.previousShown(*gap) : gaps.nextShown(*gap);
     return target && gaps.free(*target) ? target : std::nullopt;
@@ -458,6 +458,22 @@ void MenuController::openPlaceMenu(const luciole::Bookmark& bookmark, float x, f
     return;
   }
   std::vector<ContextMenuControlEntry> entries{{.id = 1, .label = "Open", .glyph = "folder-open"}};
+  if (bookmark.location == luciole::Location::network()) {
+    entries.push_back({.label = "", .separator = true});
+    entries.push_back({.id = 9, .label = "Hide Network", .glyph = "eye-off"});
+    showContextMenu(
+        std::move(entries),
+        [this](int action) {
+          if (action == 1) {
+            m_page.browser().open(luciole::Location::network());
+          } else if (action == 9) {
+            m_preferences.submit({{luciole::BrowserPreference::ShowNetwork, false}});
+          }
+        },
+        {x, y, 1, 1}
+    );
+    return;
+  }
   if (!m_pins.contains(bookmark.location)) {
     showContextMenu(
         std::move(entries), [this, location = bookmark.location](int) { m_page.browser().open(location); }, {x, y, 1, 1}
@@ -470,14 +486,9 @@ void MenuController::openPlaceMenu(const luciole::Bookmark& bookmark, float x, f
     if (found == pins.end()) {
       return std::nullopt;
     }
-    auto index = static_cast<std::size_t>(found - pins.begin());
-    while (previous ? index > 0 : index + 1 < pins.size()) {
-      index = previous ? index - 1 : index + 1;
-      if (luciole::placeShown(pins[index], m_page.settings().showNetwork)) {
-        return index;
-      }
-    }
-    return std::nullopt;
+    const auto index = static_cast<std::size_t>(found - pins.begin());
+    return previous ? (index > 0 ? std::optional(index - 1) : std::nullopt)
+                    : (index + 1 < pins.size() ? std::optional(index + 1) : std::nullopt);
   };
   // The gap under this place, above the next row Places shows, if a separator can go there.
   const auto below = [this, location = bookmark.location] -> std::optional<std::size_t> {
@@ -486,13 +497,13 @@ void MenuController::openPlaceMenu(const luciole::Bookmark& bookmark, float x, f
     if (found == pins.end()) {
       return std::nullopt;
     }
-    const luciole::SeparatorGaps gaps(m_pins, m_page.settings().showNetwork);
+    const luciole::SeparatorGaps gaps(m_pins);
     const auto next = gaps.nextShown(static_cast<std::size_t>(found - pins.begin()));
     return next && gaps.free(*next) ? next : std::nullopt;
   };
   {
     entries.push_back({.label = "", .separator = true});
-    if (!bookmark.location.isTrash() && bookmark.location != luciole::Location::network()) {
+    if (!bookmark.location.isTrash()) {
       entries.push_back({.id = 2, .label = "Unpin", .enabled = m_pins.editable(), .glyph = "pinned-off"});
       entries.push_back({.id = 6, .label = "Rename Place…", .enabled = m_pins.editable(), .glyph = "pencil"});
       entries.push_back({.id = 8, .label = "Change Icon…", .enabled = m_pins.editable(), .glyph = "paint"});
@@ -519,11 +530,7 @@ void MenuController::openPlaceMenu(const luciole::Bookmark& bookmark, float x, f
     entries.push_back({.id = 7, .label = "Empty Trash…", .enabled = false, .glyph = "trash-x", .destructive = true});
     entries.push_back({.label = "", .separator = true});
   }
-  if (bookmark.location == luciole::Location::network()) {
-    entries.push_back({.id = 9, .label = "Hide Network", .glyph = "eye-off"});
-  } else {
-    entries.push_back({.id = 5, .label = "Properties", .glyph = "info-circle"});
-  }
+  entries.push_back({.id = 5, .label = "Properties", .glyph = "info-circle"});
   showContextMenu(
       entries,
       [this, bookmark, adjacent, below](int action) {
@@ -535,8 +542,6 @@ void MenuController::openPlaceMenu(const luciole::Bookmark& bookmark, float x, f
           m_page.browser().open(bookmark.location);
         } else if (action == 2) {
           m_pins.remove(bookmark.location);
-        } else if (action == 9 && bookmark.location == luciole::Location::network()) {
-          m_preferences.submit({{luciole::BrowserPreference::ShowNetwork, false}});
         } else if (action == 7 && bookmark.location == luciole::Location::trash()) {
           m_page.dispatchAction(Action::EmptyTrash);
         } else if (action == 6) {
