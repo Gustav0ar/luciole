@@ -9,6 +9,7 @@
 #include "test_check.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <fcntl.h>
@@ -105,6 +106,25 @@ namespace {
     result.setIdentity(luciole::readFileIdentity(info.get()));
     return result;
   }
+  void activityAttention() {
+    const auto activity = [](ActivityState state, bool finished) {
+      luciole::JobActivity item;
+      item.state = state;
+      item.finished = finished;
+      return item;
+    };
+    TEST_CHECK(!luciole::activitiesNeedAttention({}));
+    TEST_CHECK(luciole::activitiesNeedAttention(std::array{activity(ActivityState::Working, false)}));
+    TEST_CHECK(!luciole::activitiesNeedAttention(
+        std::array{activity(ActivityState::Succeeded, true), activity(ActivityState::Cancelled, true)}
+    ));
+    TEST_CHECK(
+        luciole::activitiesNeedAttention(
+            std::array{activity(ActivityState::Succeeded, true), activity(ActivityState::Partial, true)}
+        )
+    );
+  }
+
   void removableFlushActivity(Pump& pump) {
     Fixture fixture;
     fixture.write("first");
@@ -1291,6 +1311,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   TEST_CHECK(argc == 1);
+  activityAttention();
   removableFlushActivity(pump);
   overwriteHistory(pump);
   trashMoveNotifications(pump, false);
