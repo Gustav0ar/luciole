@@ -292,7 +292,7 @@ namespace {
     }
     TEST_CHECK(read(outer) == original && fs::is_empty(fixture.root / "tmp"));
   }
-  void testNestedArchiveBudget(const Fixture& fixture, Pump& pump) {
+  void testDeepNestedArchives(const Fixture& fixture, Pump& pump) {
     const auto archive = fixture.root / "nested-budget.zip";
     makeArchive(archive, {{"payload.txt", "leaf payload", ""}}, ARCHIVE_FORMAT_ZIP);
     for (unsigned i = 0; i < 34; ++i) {
@@ -303,7 +303,7 @@ namespace {
     levels.push_back(std::make_unique<luciole::ArchiveService>());
     TEST_CHECK(levels.back()->inspect(location(archive)));
     wait(*levels.back(), pump);
-    for (unsigned i = 0; i < 32; ++i) {
+    for (unsigned i = 0; i < 34; ++i) {
       auto& parent = *levels.back();
       TEST_CHECK(parent.openMember("next.zip"));
       wait(parent, pump);
@@ -315,8 +315,10 @@ namespace {
       wait(*child, pump);
       levels.push_back(std::move(child));
     }
-    TEST_CHECK(!levels.back()->openMember("next.zip"));
-    TEST_CHECK(levels.back()->error() && levels.back()->error()->kind == luciole::FileErrorKind::NoSpace);
+    TEST_CHECK(levels.back()->openMember("payload.txt"));
+    wait(*levels.back(), pump);
+    const auto leaf = levels.back()->takeOpenedMember();
+    TEST_CHECK(leaf && !leaf->archive && read(*leaf->location.nativePath()) == "leaf payload");
     for (const auto& level : std::views::reverse(levels)) {
       level->shutdown();
     }
@@ -628,7 +630,7 @@ namespace {
     return 0;
   }
 
-  void testLargeSparseMember(const Fixture& fixture) {
+  void testLargeSparseMember(const Fixture& fixture, Pump& pump) {
     const auto source = fixture.root / "large-sparse.tar";
     constexpr std::uint64_t size = 9ULL * 1024 * 1024 * 1024;
     const luciole::GioPtr<GSubprocess> encoder(g_subprocess_new(
@@ -653,6 +655,41 @@ namespace {
         && std::string_view(bytes.data(), 4) == "TAIL"
     );
     TEST_CHECK(!luciole::archive_work::cleanup({result.stage}) && fs::is_empty(fixture.root / "tmp"));
+
+    // Logical file size is independent of the temporary filesystem's allocated capacity.
+    const auto original = read(source);
+    luciole::ArchiveService service;
+    TEST_CHECK(service.inspect(location(source)));
+    wait(service, pump);
+    std::vector<fs::path> retained;
+    retained.reserve(2);
+    for (unsigned i = 0; i < 2; ++i) {
+      TEST_CHECK(service.openMember("sparse"));
+      wait(service, pump);
+      const auto member = service.takeOpenedMember();
+      TEST_CHECK(member && !service.error());
+      const fs::path openedPath(*member->location.nativePath());
+      const auto opened = luciole::checkedFd(::open(openedPath.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+      const auto info = luciole::statFd(opened.get());
+      TEST_CHECK(static_cast<std::uint64_t>(info.st_size) == size && info.st_blocks * 512 < 65536);
+      TEST_CHECK(
+          ::pread(opened.get(), bytes.data(), bytes.size(), 0) == 4 && std::string_view(bytes.data(), 4) == "HEAD"
+      );
+      TEST_CHECK(
+          ::pread(opened.get(), bytes.data(), bytes.size(), static_cast<off_t>(size - 4)) == 4
+          && std::string_view(bytes.data(), 4) == "TAIL"
+      );
+      TEST_CHECK(
+          ::pread(opened.get(), bytes.data(), bytes.size(), static_cast<off_t>(size / 2)) == 4
+          && std::ranges::all_of(bytes, [](char value) { return value == 0; })
+      );
+      retained.push_back(openedPath);
+    }
+    TEST_CHECK(retained[0] != retained[1] && fs::exists(retained[0]));
+    service.shutdown();
+    wait(service, pump);
+    TEST_CHECK(std::ranges::none_of(retained, [](const auto& file) { return fs::exists(file); }));
+    TEST_CHECK(read(source) == original && fs::is_empty(fixture.root / "tmp"));
   }
 
   void testLargeCatalogue(const Fixture& fixture) {
@@ -2406,6 +2443,20 @@ esac
     wait(service, pump);
     const auto opened = service.takeOpenedMember();
     TEST_CHECK(!service.error() && opened && read(*opened->location.nativePath()) == "abc");
+    TEST_CHECK(service.openMember("large"));
+    wait(service, pump);
+    const auto large = service.takeOpenedMember();
+    TEST_CHECK(!service.error() && large && fs::file_size(*large->location.nativePath()) == 130U * 1024U * 1024U);
+    std::ifstream contents(*large->location.nativePath(), std::ios::binary);
+    std::array<char, 65536> bytes{};
+    std::uint64_t total = 0;
+    while (contents.read(bytes.data(), bytes.size()) || contents.gcount()) {
+      const auto count = contents.gcount();
+      TEST_CHECK(std::all_of(bytes.begin(), bytes.begin() + count, [](char value) { return value == 0; }));
+      total += static_cast<std::uint64_t>(count);
+    }
+    TEST_CHECK(contents.eof() && total == 130U * 1024U * 1024U);
+    TEST_CHECK(read(*opened->location.nativePath()) == "abc");
     service.shutdown();
     wait(service, pump);
     TEST_CHECK(fs::is_empty(fixture.root / "tmp"));
@@ -2528,9 +2579,18 @@ int main(int argc, char** argv) {
       Fixture fixture;
       Pump pump;
       testNestedArchives(fixture, pump);
-      testNestedArchiveBudget(fixture, pump);
+      testDeepNestedArchives(fixture, pump);
       testNestedArchivePasswords(fixture, pump);
       std::println("nested archive checks passed");
+      return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--member-capacity") {
+      Fixture fixture;
+      Pump pump;
+      testLargeSparseMember(fixture, pump);
+      testDeepNestedArchives(fixture, pump);
+      testXzMemberFromLargeArchive(fixture, pump);
+      std::println("archive member capacity checks passed");
       return 0;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--search-only-ancestors") {
@@ -2586,10 +2646,10 @@ int main(int argc, char** argv) {
     testCompressedPaddingLimit(fixture, pump);
     testRoundTrips(fixture, pump);
     testNestedArchives(fixture, pump);
-    testNestedArchiveBudget(fixture, pump);
+    testDeepNestedArchives(fixture, pump);
     testNestedArchivePasswords(fixture, pump);
     testNativeJobCapacity(fixture);
-    testLargeSparseMember(fixture);
+    testLargeSparseMember(fixture, pump);
     testLargeCatalogue(fixture);
     testCompressionPresets(fixture, pump);
     testConflicts(fixture, pump);

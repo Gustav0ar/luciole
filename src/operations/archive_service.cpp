@@ -11,15 +11,7 @@
 #include <glib.h>
 #include <utility>
 
-namespace {
-  struct ArchiveBudget {
-    std::uint64_t bytes = 0;
-    std::size_t roots = 0;
-  };
-} // namespace
-
 struct luciole::ArchiveLease {
-  std::shared_ptr<ArchiveBudget> budget;
   std::function<void()> release;
   ~ArchiveLease() {
     if (release) {
@@ -56,8 +48,6 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
   bool waitingForMembers = false;
   std::vector<std::string> waitingCleanup;
   std::vector<std::string> openStages;
-  std::uint64_t openBytes = 0;
-  std::shared_ptr<ArchiveBudget> budget = std::make_shared<ArchiveBudget>();
   std::string stage;
   std::optional<FileError> error;
   bool closing = false;
@@ -72,9 +62,6 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
       g_source_destroy(timer);
       g_source_unref(timer);
     }
-  }
-  static FileError previewFull() {
-    return {FileErrorKind::NoSpace, "Temporary archive preview storage is full. Extract the member instead."};
   }
   void notify() {
     const auto callback = changed;
@@ -103,8 +90,6 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
   }
   void clean(std::vector<std::string> paths) {
     stopTimer();
-    std::uint64_t releasedBytes = 0;
-    std::size_t releasedRoots = 0;
     if (closing) {
       catalog.reset();
       sourceLease.reset();
@@ -118,13 +103,10 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
         notify();
         return;
       }
-      releasedBytes = openBytes;
-      releasedRoots = openStages.size();
       for (auto& path : openStages) {
         paths.push_back(std::move(path));
       }
       openStages.clear();
-      openBytes = 0;
     }
     if (paths.empty()) {
       phase = ArchivePhase::Idle;
@@ -134,9 +116,7 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
     phase = ArchivePhase::Cleaning;
     runJob<std::optional<FileError>>(
         [paths = std::move(paths)] { return archive_work::cleanup(paths); },
-        [owner = shared_from_this(), releasedBytes, releasedRoots](JobResult<std::optional<FileError>> result) {
-          owner->budget->bytes -= releasedBytes;
-          owner->budget->roots -= releasedRoots;
+        [owner = shared_from_this()](JobResult<std::optional<FileError>> result) {
           if (!result) {
             owner->error = std::move(result.error());
           } else if (*result) {
@@ -155,7 +135,6 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
   std::shared_ptr<const ArchiveLease> retainMembers() {
     const std::shared_ptr<GMainContext> context(g_main_context_ref_thread_default(), g_main_context_unref);
     auto lease = std::make_shared<ArchiveLease>();
-    lease->budget = budget;
     lease->release = [owner = shared_from_this(), context] {
       // A request can release its final catalog on a worker. Always return ownership changes to the UI context.
       GSource* idle = g_idle_source_new();
@@ -223,15 +202,7 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
       return;
     }
     if (operation == Operation::Open) {
-      if (budget->roots >= 32 || prepared.expandedBytes > 512U * 1024U * 1024U - budget->bytes) {
-        error = previewFull();
-        clean({prepared.stage});
-        return;
-      }
       openStages.push_back(prepared.stage);
-      openBytes += prepared.expandedBytes;
-      budget->bytes += prepared.expandedBytes;
-      ++budget->roots;
       opened = ArchiveMember{.location = *prepared.output, .archive = prepared.archive, .lease = {}};
       phase = ArchivePhase::Idle;
       notify();
@@ -262,14 +233,6 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
     if (operation == Operation::Inspect && !lease && inspectedSource == sources.front()) {
       lease = sourceLease;
     }
-    if (operation == Operation::Inspect && lease && lease->budget != budget && !openStages.empty()) {
-      return false;
-    }
-    if (operation == Operation::Open && (budget->roots >= 32 || budget->bytes >= 512U * 1024U * 1024U)) {
-      error = previewFull();
-      notify();
-      return false;
-    }
     error.reset();
     opened.reset();
     results.clear();
@@ -286,9 +249,6 @@ struct luciole::ArchiveService::State : std::enable_shared_from_this<State> {
       catalog.reset();
       inspectedSource = sources.front();
       sourceLease = std::move(lease);
-      if (sourceLease) {
-        budget = sourceLease->budget;
-      }
     }
     request = Request{
         operation,
