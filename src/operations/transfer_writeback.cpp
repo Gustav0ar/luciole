@@ -113,7 +113,8 @@ namespace {
     if (::fstatfs(directory, &fs) != 0) {
       return 0;
     }
-    if (fs.f_type == CIFS_SUPER_MAGIC || fs.f_type == SMB2_SUPER_MAGIC) {
+    if (fs.f_type == static_cast<decltype(fs.f_type)>(CIFS_SUPER_MAGIC)
+        || fs.f_type == static_cast<decltype(fs.f_type)>(SMB2_SUPER_MAGIC)) {
       return luciole::transfer::kSmbPaceLimit;
     }
     if (
