@@ -357,7 +357,7 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
       );
     }
     // Group Local -> Removable -> Network, keeping surviving rows in their prior order within each section; root stays
-    // first. Each prior slot matches once so duplicate fallback keys keep their interleaved order.
+    // first. Each prior slot matches once so duplicate keys (cloned UUIDs) keep their interleaved order.
     struct RankedDrive {
       Drive drive;
       std::uint8_t kind = 0;
