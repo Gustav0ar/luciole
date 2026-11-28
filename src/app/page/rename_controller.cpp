@@ -398,7 +398,7 @@ void RenameController::navigateInlineRename(int direction, bool byRow) {
       model.requestDetails(*nextId, 0);
       const auto retiring = m_job;
       m_resumeNextTarget = PendingResume{
-          .id = nextId,
+          .id = *nextId,
           .location = *nextLocation,
           .contextSerial = m_page.browser().contextSerial(),
           .direction = direction,
@@ -433,7 +433,7 @@ void RenameController::resumeSteppingFrom(std::size_t rowIndex, int direction, s
     (void)model.select(*nextId);
     model.requestDetails(*nextId, 0);
     m_resumeNextTarget = PendingResume{
-        .id = nextId,
+        .id = *nextId,
         .location = *nextLocation,
         .contextSerial = m_page.browser().contextSerial(),
         .direction = direction,
@@ -681,8 +681,8 @@ void RenameController::advancePendingResume() {
     return;
   }
   std::optional<luciole::EntryId> matched;
-  if (m_resumeNextTarget->id && model.rowOf(*m_resumeNextTarget->id)) {
-    if (const auto location = model.location(*m_resumeNextTarget->id);
+  if (model.rowOf(m_resumeNextTarget->id)) {
+    if (const auto location = model.location(m_resumeNextTarget->id);
         location && *location == m_resumeNextTarget->location) {
       matched = m_resumeNextTarget->id;
     }
@@ -786,7 +786,7 @@ void RenameController::layoutInline(Renderer& renderer) {
     m_inlineErrorBanner->setVisible(false);
     return;
   }
-  const float inputH = std::max(kInlineMinHeight, labelRect->height + 6.0F);
+  const float inputH = std::max(kInlineMinHeight, labelRect->height + kInputTextInnerInset * 2.0F);
   const float labelCenterY = labelRect->y + labelRect->height * 0.5F;
   const float inputX = labelRect->x - kInputTextInnerInset;
   const float inputY = std::round(labelCenterY - inputH * 0.5F);

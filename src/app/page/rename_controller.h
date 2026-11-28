@@ -84,7 +84,7 @@ private:
     std::size_t stride = 1;
   };
   struct PendingResume {
-    std::optional<luciole::EntryId> id = std::nullopt;
+    luciole::EntryId id = 0;
     luciole::Location location;
     std::uint64_t contextSerial = 0;
     int direction = 0;
