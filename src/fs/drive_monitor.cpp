@@ -655,7 +655,6 @@ struct luciole::DriveMonitor::State::RemoveRequest {
   bool hasBlockVolume = false;
   GioPtr<GMountOperation> operation;
   GioPtr<GCancellable> cancellable;
-  GioPtr<GDBusConnection> bus;
   std::string initialError;
   DriveRemoveResult result;
 
@@ -808,7 +807,7 @@ struct luciole::DriveMonitor::State::RemoveRequest {
     GVariantBuilder options{};
     g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
     g_variant_builder_add(&options, "{sv}", "auth.no_user_interaction", g_variant_new_boolean(FALSE));
-    auto* bus = request->bus.get();
+    auto* bus = G_DBUS_CONNECTION(source);
     auto* cancellable = request->cancellable.get();
     g_dbus_connection_call(
         bus, "org.freedesktop.UDisks2", objectPath->c_str(), "org.freedesktop.UDisks2.Filesystem", "Unmount",
@@ -820,7 +819,7 @@ struct luciole::DriveMonitor::State::RemoveRequest {
   static void onSystemBusReady(GObject*, GAsyncResult* result, gpointer data) {
     std::unique_ptr<RemoveRequest> request(static_cast<RemoveRequest*>(data));
     GError* error = nullptr;
-    GioPtr<GDBusConnection> bus(g_bus_get_finish(result, &error));
+    const GioPtr<GDBusConnection> bus(g_bus_get_finish(result, &error));
     const GErrorPtr owned(error);
     if (request->state.expired()) {
       return;
@@ -833,11 +832,9 @@ struct luciole::DriveMonitor::State::RemoveRequest {
       startPkexec(std::move(request));
       return;
     }
-    request->bus = std::move(bus);
-    auto* connection = request->bus.get();
     auto* cancellable = request->cancellable.get();
     g_dbus_connection_call(
-        connection, "org.freedesktop.UDisks2", "/org/freedesktop/UDisks2", "org.freedesktop.DBus.ObjectManager",
+        bus.get(), "org.freedesktop.UDisks2", "/org/freedesktop/UDisks2", "org.freedesktop.DBus.ObjectManager",
         "GetManagedObjects", nullptr, G_VARIANT_TYPE("(a{oa{sa{sv}}})"), G_DBUS_CALL_FLAGS_NONE, -1, cancellable,
         onManagedObjectsReady, request.release()
     );
@@ -994,7 +991,6 @@ void luciole::DriveMonitor::remove(const std::string& key, std::function<void(Dr
       .hasBlockVolume = hasBlockVolume,
       .operation = GioPtr<GMountOperation>(g_mount_operation_new()),
       .cancellable = GioPtr<GCancellable>(G_CANCELLABLE(g_object_ref(m_state->cancellable.get()))),
-      .bus = {},
       .initialError = {},
       .result = {}
   });
