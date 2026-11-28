@@ -262,6 +262,14 @@ namespace {
     return luciole::GioPtr<GVolume>(G_VOLUME(volume));
   }
 
+  void setVolumeMount(GVolume* volume, const char* uri) {
+    auto* mock = reinterpret_cast<MockVolume*>(volume);
+    g_clear_object(&mock->mount);
+    if (uri != nullptr) {
+      mock->mount = makeMount(mock->name, uri, volume).release();
+    }
+  }
+
   void collectLabels(const Node& node, std::vector<std::string>& out) {
     if (!node.visible()) {
       return;
@@ -293,6 +301,8 @@ namespace {
       fs::create_directories(root / "config");
       fs::create_directories(root / "mnt-local");
       fs::create_directories(root / "mnt-loop");
+      fs::create_directories(root / "mnt-iso");
+      fs::create_directories(root / "mnt-sd");
       g_setenv("HOME", (root / "home").c_str(), TRUE);
       g_setenv("XDG_CONFIG_HOME", (root / "config").c_str(), TRUE);
       std::ofstream(root / "config/user-dirs.dirs")
@@ -308,10 +318,10 @@ namespace {
     }
   };
 
-  void waitPins(const luciole::PinService& pins) {
+  void waitUntil(const std::function<bool()>& done) {
     GlibPollSource source;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (pins.busy()) {
+    while (!done()) {
       TEST_CHECK(std::chrono::steady_clock::now() < deadline);
       std::vector<pollfd> fds;
       const auto start = source.addPollFds(fds);
@@ -319,6 +329,10 @@ namespace {
       TEST_CHECK(::poll(fds.data(), fds.size(), timeout < 0 ? 20 : std::min(timeout, 20)) >= 0);
       source.dispatch(fds, start);
     }
+  }
+
+  void waitPins(const luciole::PinService& pins) {
+    waitUntil([&] { return !pins.busy(); });
   }
 
   void testClassifyDrive() {
@@ -362,6 +376,8 @@ namespace {
 
     const auto localUri = luciole::Location::fromPath((fixture.root / "mnt-local").native()).uri();
     const auto loopUri = luciole::Location::fromPath((fixture.root / "mnt-loop").native()).uri();
+    const auto isoUri = luciole::Location::fromPath((fixture.root / "mnt-iso").native()).uri();
+    const auto sdUri = luciole::Location::fromPath((fixture.root / "mnt-sd").native()).uri();
     const auto fixedDrive = makeDrive();
     const auto hotplugDrive = makeDrive();
     const auto mediaDrive = makeDrive({.mediaRemovable = true});
@@ -411,7 +427,7 @@ namespace {
     TEST_CHECK(
         sidebarLabels(sidebar)
         == std::vector<std::string>(
-            {"Places", "Home", "Trash", "Drives", "File System", "Debian ISO", "Backup.zip", "Games", "Arch ISO",
+            {"Places", "Home", "Trash", "Drives", "File System", "Games", "Arch ISO", "Debian ISO", "Backup.zip",
              "Remote", "Network"}
         )
     );
@@ -420,7 +436,7 @@ namespace {
     TEST_CHECK(
         sidebarLabels(sidebar)
         == std::vector<std::string>(
-            {"Places", "Home", "Trash", "Drives", "File System", "Debian ISO", "Backup.zip", "Games", "Arch ISO"}
+            {"Places", "Home", "Trash", "Drives", "File System", "Games", "Arch ISO", "Debian ISO", "Backup.zip"}
         )
     );
     sidebar.setShowNetwork(true);
@@ -447,30 +463,71 @@ namespace {
     g_signal_emit_by_name(activeMonitor, "volume-added", sdCard.get());
     sidebar.invalidate();
 
-    std::vector<std::string> driveOrder;
-    for (const auto& drive : drives.drives()) {
-      driveOrder.push_back(drive.label);
-    }
-    TEST_CHECK(
-        driveOrder
-        == std::vector<std::string>(
-            {"File System", "Backup.zip", "Games", "Arch ISO", "USB Drive", "Phone", "SD Card", "Filmes", "TV",
-             "Archive", "Cloud"}
-        )
-    );
+    const std::vector<std::string> expectedDriveOrder{"File System", "Games",   "Arch ISO", "Backup.zip",
+                                                      "USB Drive",   "SD Card", "Phone",    "TV",
+                                                      "Archive",     "Cloud",   "Filmes"};
+    const auto collectDriveOrder = [&] {
+      std::vector<std::string> order;
+      for (const auto& drive : drives.drives()) {
+        order.push_back(drive.label);
+      }
+      return order;
+    };
+    TEST_CHECK(collectDriveOrder() == expectedDriveOrder);
     TEST_CHECK(drives.find("volume:uuid-usb")->glyph == "device-usb");
     TEST_CHECK(drives.find("volume:uuid-sd")->kind == luciole::DriveKind::Removable);
     TEST_CHECK(drives.find("volume:uuid-phone")->kind == luciole::DriveKind::Removable);
     TEST_CHECK(drives.find("volume:nas.local:/export/archive")->kind == luciole::DriveKind::Network);
     TEST_CHECK(drives.find("mount:smb://nas.local/filmes/")->glyph == "server");
 
+    const std::vector<std::string> expectedSidebarLabels{
+        "Places",    "Home",    "Trash", "Drives", "File System", "Games", "Arch ISO", "Backup.zip", "Removable",
+        "USB Drive", "SD Card", "Phone", "Remote", "Network",     "TV",    "Archive",  "Cloud",      "Filmes"
+    };
+    TEST_CHECK(sidebarLabels(sidebar) == expectedSidebarLabels);
+
+    // Mounting and unmounting entries keeps each row in its original slot even if GIO reorders its volume list.
+    setVolumeMount(loopIso.get(), isoUri.c_str());
+    setVolumeMount(sdCard.get(), sdUri.c_str());
+    setVolumeMount(networkNfs.get(), "nfs://nas.local/export/archive/");
+    std::ranges::reverse(currentVolumes);
+    for (auto* volume : {loopIso.get(), sdCard.get(), networkNfs.get()}) {
+      const luciole::GioPtr<GMount> mount(g_volume_get_mount(volume));
+      g_signal_emit_by_name(activeMonitor, "mount-added", mount.get());
+    }
+    sidebar.invalidate();
+    TEST_CHECK(drives.find("volume:uuid-iso")->root.has_value());
+    TEST_CHECK(drives.find("volume:uuid-sd")->root.has_value());
+    TEST_CHECK(drives.find("volume:nas.local:/export/archive")->root.has_value());
+    TEST_CHECK(collectDriveOrder() == expectedDriveOrder);
+    TEST_CHECK(sidebarLabels(sidebar) == expectedSidebarLabels);
+
+    // Tree mode reflects the newly mounted entries in the same section order.
+    sidebar.setTreeEnabled(true);
     TEST_CHECK(
         sidebarLabels(sidebar)
         == std::vector<std::string>(
-            {"Places", "Home", "Trash", "Drives", "File System", "Backup.zip", "Games", "Arch ISO", "Removable",
-             "USB Drive", "Phone", "SD Card", "Remote", "Network", "Filmes", "TV", "Archive", "Cloud"}
+            {"Folders", "Home", "Trash", "File System", "Arch ISO", "Backup.zip", "USB Drive", "SD Card", "Phone",
+             "Network", "Archive", "Filmes"}
         )
     );
+    sidebar.setTreeEnabled(false);
+
+    std::vector<luciole::GioPtr<GMount>> removedMounts;
+    for (auto* volume : {loopIso.get(), sdCard.get(), networkNfs.get()}) {
+      removedMounts.emplace_back(g_volume_get_mount(volume));
+      setVolumeMount(volume, nullptr);
+    }
+    std::ranges::reverse(currentVolumes);
+    for (const auto& mount : removedMounts) {
+      g_signal_emit_by_name(activeMonitor, "mount-removed", mount.get());
+    }
+    sidebar.invalidate();
+    TEST_CHECK(!drives.find("volume:uuid-iso")->root.has_value());
+    TEST_CHECK(!drives.find("volume:uuid-sd")->root.has_value());
+    TEST_CHECK(!drives.find("volume:nas.local:/export/archive")->root.has_value());
+    TEST_CHECK(collectDriveOrder() == expectedDriveOrder);
+    TEST_CHECK(sidebarLabels(sidebar) == expectedSidebarLabels);
 
     // Show Drives hides Drives, Removable, and remote shares; Remote still shows Network while Show Network is on.
     sidebar.setShowDrives(false);
@@ -483,8 +540,8 @@ namespace {
     TEST_CHECK(
         sidebarLabels(sidebar)
         == std::vector<std::string>(
-            {"Places", "Home", "Trash", "Drives", "File System", "Backup.zip", "Games", "Arch ISO", "Removable",
-             "USB Drive", "Phone", "SD Card", "Remote", "Filmes", "TV", "Archive", "Cloud"}
+            {"Places", "Home", "Trash", "Drives", "File System", "Games", "Arch ISO", "Backup.zip", "Removable",
+             "USB Drive", "SD Card", "Phone", "Remote", "TV", "Archive", "Cloud", "Filmes"}
         )
     );
 
@@ -508,6 +565,59 @@ namespace {
             {"Folders", "Home", "Trash", "File System", "Backup.zip", "USB Drive", "Phone", "Filmes"}
         )
     );
+
+    // Same-name fallback volumes interleaved around another volume stay distinct and keep order and cached usage across
+    // reversed refreshes.
+    const auto dupUnmounted = makeVolume({.name = "Backup", .volumeClass = "device", .drive = fixedDrive.get()});
+    const auto middleVolume =
+        makeVolume({.name = "Media", .id = "uuid-media", .volumeClass = "device", .drive = fixedDrive.get()});
+    auto dupMounted =
+        makeVolume({.name = "Backup", .volumeClass = "device", .drive = fixedDrive.get(), .mountUri = isoUri.c_str()});
+    currentVolumes = {dupUnmounted.get(), middleVolume.get(), dupMounted.get()};
+    currentMounts.clear();
+    g_signal_emit_by_name(activeMonitor, "volume-added", dupUnmounted.get());
+    const auto collectLocalOrder = [&] {
+      std::vector<std::string> order;
+      for (const auto& drive : drives.drives()) {
+        if (drive.kind == luciole::DriveKind::Local) {
+          order.push_back(drive.label);
+        }
+      }
+      return order;
+    };
+    const std::vector<std::string> expectedLocalOrder{"File System", "Backup", "Media", "Backup"};
+    TEST_CHECK(collectLocalOrder() == expectedLocalOrder);
+    TEST_CHECK(drives.drives()[1].key != drives.drives()[3].key);
+    TEST_CHECK(!drives.drives()[1].root.has_value() && drives.drives()[3].root.has_value());
+    const std::string dupMountedKey = drives.drives()[3].key;
+    drives.refreshUsage();
+    waitUntil([&] {
+      const auto* rootDrive = drives.find("root");
+      const auto* dupDrive = drives.find(dupMountedKey);
+      return rootDrive && rootDrive->usage.has_value() && dupDrive && dupDrive->usage.has_value();
+    });
+    const auto savedUsage = drives.find(dupMountedKey)->usage;
+    const auto orderBeforeReverse = collectDriveOrder();
+    const int changesBeforeNoOp = driveChanges;
+    std::ranges::reverse(currentVolumes);
+    g_signal_emit_by_name(activeMonitor, "drive-changed", fixedDrive.get());
+    TEST_CHECK(driveChanges == changesBeforeNoOp);
+    TEST_CHECK(collectDriveOrder() == orderBeforeReverse);
+    TEST_CHECK(collectLocalOrder() == expectedLocalOrder);
+    TEST_CHECK(!drives.drives()[1].root.has_value() && drives.drives()[3].root.has_value());
+    TEST_CHECK(drives.find(dupMountedKey)->usage == savedUsage);
+
+    // Replacing a removed identifier-less volume allocates a fresh fallback key rather than reusing the old one.
+    currentVolumes = {dupUnmounted.get(), middleVolume.get()};
+    g_signal_emit_by_name(activeMonitor, "volume-removed", dupMounted.get());
+    dupMounted.reset();
+    TEST_CHECK(drives.find(dupMountedKey) == nullptr);
+    const auto dupReplacement =
+        makeVolume({.name = "Backup", .volumeClass = "device", .drive = fixedDrive.get(), .mountUri = sdUri.c_str()});
+    currentVolumes = {dupUnmounted.get(), middleVolume.get(), dupReplacement.get()};
+    g_signal_emit_by_name(activeMonitor, "volume-added", dupReplacement.get());
+    TEST_CHECK(drives.find(dupMountedKey) == nullptr);
+    TEST_CHECK(drives.drives()[3].key != dupMountedKey && drives.drives()[3].key != drives.drives()[1].key);
   }
 } // namespace
 

@@ -2,6 +2,7 @@
 
 #include "fs/gio_interop.h"
 
+#include <algorithm>
 #include <map>
 #include <set>
 
@@ -142,5 +143,6 @@ luciole::readSystemdMounts(GDBusConnection* connection, const CancelToken& token
       result.push_back(previous);
     }
   }
+  std::ranges::sort(result, {}, &MountConfiguration::path);
   return result;
 }
