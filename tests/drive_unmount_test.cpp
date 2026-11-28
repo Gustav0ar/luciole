@@ -28,7 +28,7 @@ namespace {
     bool succeed = false;
     bool emitBusyProcess = false;
     GIOErrorEnum errorCode = G_IO_ERROR_FAILED;
-    std::string errorMessage{};
+    std::string errorMessage;
   };
 
   struct MockMount {
@@ -603,7 +603,7 @@ int main() {
     }
 
     // 8. GIO busy, FAILED_HANDLED, non-native mounts, and already-denied block volumes never escalate.
-    nextUnmountReply = {.succeed = false, .emitBusyProcess = true};
+    nextUnmountReply = {.succeed = false, .emitBusyProcess = true, .errorMessage = {}};
     {
       const auto result = runRemove(drives, fstabKey);
       TEST_CHECK(result.busy && !result.blockers.empty() && !fs::exists(pkexecLog));
