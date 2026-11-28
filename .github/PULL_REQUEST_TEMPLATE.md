@@ -1,3 +1,17 @@
+<!-- A bot checks this description and converts the pull request back to a draft if
+     required structure is missing. It never closes the pull request.
+
+     Required: the Summary, Motivation, Type of Change, Testing, and Checklist
+     headings, and the Checklist wording below. Before marking a pull request ready for
+     review, check exactly one change type and every Checklist item.
+
+     Everything else may be deleted, including these guidance comments and any of the
+     Related Issue, Screenshots / Videos, and Additional Notes sections. In Type of
+     Change, keep only the lines that apply.
+
+     An explanation does not replace a required check. If a required statement is not
+     true yet, keep the pull request as Draft. -->
+
 ## Summary
 
 <!-- What changed? -->
@@ -9,7 +23,8 @@
 ## Type of Change
 
 <!-- A pull request covers one feature, fix, or refactor; split unrelated changes into
-     separate pull requests. Keep the lines that apply. -->
+     separate pull requests. Check exactly one type, plus Breaking change if it applies.
+     Documentation that ships with a feature or fix is part of that type. -->
 
 - [ ] Bug fix
 - [ ] New feature
@@ -28,13 +43,24 @@
 
 ## Screenshots / Videos
 
-<!-- For visual or interaction changes. Delete otherwise. -->
+<!-- For visual or interaction changes. -->
 
 ## Checklist
 
+<!-- Before marking the pull request ready for review, check every item below. -->
+
+- [ ] This PR is ready for review, or it is marked as Draft.
 - [ ] This change fits `SCOPE.md`, or its scope was agreed in an issue or on Discord first.
-- [ ] I read and followed `CONTRIBUTING.md`.
-- [ ] I ran `just format` and `just lint` on touched code.
-- [ ] I tested the change in a running Luciole.
+- [ ] I read and followed the relevant guidance in `CONTRIBUTING.md`.
+- [ ] I ran `just format`, or this PR has no C++ changes.
+- [ ] I ran `just lint` and the relevant build or test commands, or explained why they were not run.
+- [ ] I ran `just role-alpha-check`, or this PR does not change UI colors.
+- [ ] I tested the change in a running Luciole where automated checks are insufficient.
 - [ ] I self-reviewed the changes.
-- [ ] I updated `docs/` if user-facing behavior or settings changed.
+- [ ] I checked for new warnings or errors.
+- [ ] I updated `docs/`, or this PR does not change user-facing behavior or settings.
+- [ ] I used canonical names for settings, paths, and identifiers.
+
+## Additional Notes
+
+<!-- Add follow-up notes, reviewer context, or known limitations. -->
