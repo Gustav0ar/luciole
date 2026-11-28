@@ -618,6 +618,15 @@ namespace {
     g_signal_emit_by_name(activeMonitor, "volume-added", dupReplacement.get());
     TEST_CHECK(drives.find(dupMountedKey) == nullptr);
     TEST_CHECK(drives.drives()[3].key != dupMountedKey && drives.drives()[3].key != drives.drives()[1].key);
+
+    // Volumes sharing a UUID (two loop-mounted copies of one ISO) stay distinct rows keyed by their block device.
+    const auto isoCopyA =
+        makeVolume({.name = "Copy", .id = "uuid-same", .unixDevice = "/dev/loop2", .volumeClass = "loop"});
+    const auto isoCopyB =
+        makeVolume({.name = "Copy", .id = "uuid-same", .unixDevice = "/dev/loop3", .volumeClass = "loop"});
+    currentVolumes = {isoCopyA.get(), isoCopyB.get()};
+    g_signal_emit_by_name(activeMonitor, "volume-added", isoCopyA.get());
+    TEST_CHECK(drives.find("volume:/dev/loop2") != nullptr && drives.find("volume:/dev/loop3") != nullptr);
   }
 } // namespace
 

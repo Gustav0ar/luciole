@@ -29,8 +29,9 @@ namespace {
   };
 
   std::string identifier(GVolume* volume) {
+    // The block device comes first: UUIDs repeat across cloned disks and copies of one ISO image.
     for (const auto* kind :
-         {G_VOLUME_IDENTIFIER_KIND_UUID, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE, G_VOLUME_IDENTIFIER_KIND_NFS_MOUNT}) {
+         {G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE, G_VOLUME_IDENTIFIER_KIND_UUID, G_VOLUME_IDENTIFIER_KIND_NFS_MOUNT}) {
       if (const luciole::GString value(g_volume_get_identifier(volume, kind)); value) {
         return value.get();
       }
