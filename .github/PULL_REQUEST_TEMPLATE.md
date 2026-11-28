@@ -32,6 +32,7 @@
 
 ## Checklist
 
+- [ ] This change fits `SCOPE.md`, or its scope was agreed in an issue or on Discord first.
 - [ ] I read and followed `CONTRIBUTING.md`.
 - [ ] I ran `just format` and `just lint` on touched code.
 - [ ] I tested the change in a running Luciole.
