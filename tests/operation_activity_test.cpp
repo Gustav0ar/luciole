@@ -1,3 +1,4 @@
+#include "app/job_activity.h"
 #include "app/operation_hub.h"
 #include "event_loop/glib_poll_source.h"
 #include "fs/gio_interop.h"
@@ -180,6 +181,7 @@ namespace {
       pump.until([&] { return devService.flushPhase() == luciole::TransferFlush::Device; });
       const auto devActivity = devWorkspace.hub.activities().front();
       TEST_CHECK(devActivity.state == ActivityState::Working && devActivity.summary == "Writing to device…");
+      TEST_CHECK(devActivity.meters.empty());
       TEST_CHECK(devActivity.canCancel && devWorkspace.hub.cancelActivity(devJob->id()));
       devRelease.release();
       pump.until([&] { return !devService.busy(); });
@@ -246,6 +248,75 @@ namespace {
       TEST_CHECK(archWorkspace.hub.activities().front().state == ActivityState::Succeeded);
     }
   }
+  // The row line of a running transfer for each measurement state: scanning, measured, lower bound, unmeasured.
+  void transferMetersLine() {
+    luciole::TransferProgress scanning;
+    scanning.estimating = true;
+    TEST_CHECK(transferMetersText(scanning).starts_with("Measuring size · "));
+    luciole::TransferProgress measured{
+        .bytes = 1024,
+        .completed = 0,
+        .total = 2,
+        .bytesTotal = 4096,
+        .bytesPerSecond = 1024,
+        .files = 1,
+        .filesTotal = 3,
+        .current = "a.txt"
+    };
+    // GLib separates a size from its unit with a no-break space.
+    TEST_CHECK(
+        transferMetersText(measured)
+        == "1.0\u00a0KiB of 4.0\u00a0KiB transferred · 1.0\u00a0KiB/s · 1 of 3 files · 3s left\nNow: a.txt"
+    );
+    measured.partial = true;
+    const auto bounded = transferMetersText(measured);
+    TEST_CHECK(
+        bounded.contains("of at least 4.0\u00a0KiB")
+        && bounded.contains("1 of 3+ files")
+        && bounded.contains("~3s left")
+    );
+    measured.partial = false;
+    measured.bytes = 4000;
+    TEST_CHECK(transferMetersText(measured).contains("less than a second left"));
+    luciole::TransferProgress unmeasured;
+    unmeasured.bytes = 1024;
+    unmeasured.completed = 1;
+    unmeasured.total = 2;
+    TEST_CHECK(transferMetersText(unmeasured) == "1.0\u00a0KiB transferred · 1 of 2 items");
+  }
+  // Measured totals and the details text of a removable copy, during its final device write and after it.
+  void transferProgressActivity(Pump& pump) {
+    Fixture fixture;
+    fixture.write("payload");
+    std::binary_semaphore release(0);
+    Workspace workspace;
+    luciole::transfer::WritebackOps ops{
+        .removable = [](int, dev_t) { return true; },
+        .sync = [&](int) { TEST_CHECK(release.try_acquire_for(std::chrono::seconds(10))); }
+    };
+    auto job = workspace.hub.create<luciole::TransferService>(workspace.page, JobScope::Follow, std::move(ops));
+    auto& service = job->service<luciole::TransferService>();
+    TEST_CHECK(service.start({{fixture.at("payload")}, fixture.at("destination"), luciole::TransferAction::Copy}));
+    pump.until([&] { return service.flushPhase() == luciole::TransferFlush::Final; });
+    const auto activity = workspace.hub.activities().front();
+    const auto measured = service.progress();
+    TEST_CHECK(measured.total == 1 && measured.completed == 1);
+    TEST_CHECK(measured.filesTotal == 1 && measured.files == 1);
+    TEST_CHECK(measured.bytesTotal == measured.bytes && measured.bytes > 0 && !measured.estimating);
+    // The writeback phase has no measurable denominator: the row shows its flush summary instead of
+    // meters, and the bar stays indeterminate, because a full bar would claim a write that has not landed yet.
+    TEST_CHECK(activity.meters.empty() && activity.summary == "Writing to device…");
+    TEST_CHECK(activity.info.contains("Transferred"));
+    TEST_CHECK(!activity.progress);
+    release.release();
+    pump.until([&] { return !service.busy(); });
+    // A finished job keeps its measured fields and gains the elapsed time; live meters belong to
+    // a running job, so its row still shows the summary.
+    const auto done = workspace.hub.activities().front();
+    TEST_CHECK(done.state == ActivityState::Succeeded && done.meters.empty());
+    TEST_CHECK(done.info.contains("Elapsed") && done.info.contains("Transferred"));
+  }
+
   void batchRenameHistory(Pump& pump) {
     Fixture fixture;
     fixture.write("a");
@@ -1367,6 +1438,8 @@ int main(int argc, char** argv) {
   TEST_CHECK(argc == 1);
   activityAttention();
   removableFlushActivity(pump);
+  transferMetersLine();
+  transferProgressActivity(pump);
   overwriteHistory(pump);
   trashMoveNotifications(pump, false);
   transferLifecycle(pump);

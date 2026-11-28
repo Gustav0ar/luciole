@@ -25,6 +25,7 @@ test_table = [
   {'name': 'operation-activity', 'deps': [app_jobs_dep, event_loop_dep], 'env': gio_env},
   {'name': 'operation-history', 'deps': [app_jobs_dep, event_loop_dep], 'timeout': 120, 'env': gio_env},
   {'name': 'drive-removal', 'deps': [app_jobs_dep, event_loop_dep], 'env': gio_env},
+  {'name': 'drive-unmount', 'deps': [fs_dep, event_loop_dep], 'env': gio_env},
   {'name': 'device-mount', 'deps': [browser_dep], 'env': gio_env},
   {'name': 'drive-glyph', 'deps': [ui_dep], 'env': assets_env},
   {'name': 'archive-service', 'deps': [operations_dep, event_loop_dep], 'timeout': 90, 'env': gio_env},
