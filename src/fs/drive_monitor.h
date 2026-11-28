@@ -31,10 +31,12 @@ namespace luciole {
   };
 
   struct DriveRemoveResult {
-    // Empty on success.
+    // Empty on success or cancellation.
     std::string error;
     // Set when open files kept the drive busy; nothing was unmounted then.
     bool busy = false;
+    // Set when the user cancelled or dismissed an authentication prompt.
+    bool cancelled = false;
     std::vector<DriveBlocker> blockers;
   };
 
@@ -91,7 +93,7 @@ namespace luciole {
     // monitor services, so the application calls it after its first frame. Idempotent.
     void start();
 
-    // Local drives, removable devices, then network shares; mounted entries lead each group and "/" stays first.
+    // Local drives, removable devices, then network shares; "/" stays first and surviving entries keep their order.
     const std::vector<Drive>& drives() const;
     const Drive* find(const std::string& key) const;
     void setChangedCallback(std::function<void()> callback);
@@ -103,7 +105,8 @@ namespace luciole {
     void
     mount(const std::string& key, LocationMount& request, std::function<void(std::expected<Location, FileError>)> done);
     // Removes the drive as its `removal` says, without forcing: when files on it are open, nothing is unmounted
-    // and the result lists the processes GIO found.
+    // and the result lists the processes GIO found. When an unprivileged local unmount requires elevated
+    // permissions, falls back to UDisks2 or pkexec so Polkit can prompt for authentication.
     void remove(const std::string& key, std::function<void(DriveRemoveResult)> done);
 
   private:

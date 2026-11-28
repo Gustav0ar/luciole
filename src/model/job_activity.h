@@ -15,6 +15,8 @@ namespace luciole {
     ActivityState state = ActivityState::Preparing;
     std::optional<float> progress;
     std::shared_ptr<const std::string> report;
+    // Transfer only: the row's live meters line, and every measured field for the details dialog.
+    std::string meters, info;
     bool finished = false, canCancel = false, canRetry = false, canReview = false;
     bool failed() const { return state == ActivityState::Failed || state == ActivityState::Partial; }
   };

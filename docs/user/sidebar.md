@@ -46,7 +46,7 @@ In the flat sidebar, the **Remote** section lists **Network** followed by mounte
 
 ## Use Drives
 
-In the flat sidebar, **Drives** starts with File System (`/`), followed by internal partitions and other local volumes. Attached USB drives, SD cards, phones, cameras and optical media appear in a separate **Removable** section below **Drives** whenever one or more are connected, and mounted or configured network shares appear under **Remote**. **Settings → Appearance → Sidebar → Show Drives** controls all drive, removable and share rows. The folder tree lists mounted drives and configured system automounts under **Folders** without section headings. System mounts such as `/home` and bind mounts are not listed.
+In the flat sidebar, **Drives** starts with File System (`/`), followed by internal partitions and other local volumes. Attached USB drives, SD cards, phones, cameras and optical media appear in a separate **Removable** section below **Drives** whenever one or more are connected, and mounted or configured network shares appear under **Remote**. **Settings → Appearance → Sidebar → Show Drives** controls all drive, removable and share rows. Rows that remain visible in the same section keep their relative order when a drive or share is mounted or unmounted. The folder tree lists only mounted drives and configured system automounts under **Folders** without section headings. System mounts such as `/home` and bind mounts are not listed.
 
 A mounted drive shows a bar of used space under its row, red at 90% used or more. Unmounted drives and filesystems that report no size have no bar. Hovering a mounted drive shows its mountpoint and free space.
 
@@ -68,4 +68,4 @@ Unlocking needs the UDisks2 system service and working D-Bus connections. System
 
 The eject button and the drive's context menu offer the right action: **Safely Remove** powers off a USB disk plugged in during the session, **Eject** ejects removable media, and **Unmount** handles anything else.
 
-Removal never forces: active operations or programs with open files prevent it, and the status bar names the blockers. [Undo](undo-redo.md) history involving that drive is discarded.
+Removal never forces: active operations or programs with open files prevent it, and the status bar names the blockers. System policy may ask for authorization when unmounting a drive that requires elevated permissions. [Undo](undo-redo.md) history involving that drive is discarded.

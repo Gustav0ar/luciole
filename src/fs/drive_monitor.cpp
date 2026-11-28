@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <format>
 #include <fstream>
 #include <gio/gio.h>
@@ -15,6 +17,8 @@
 #include <map>
 #include <set>
 #include <string_view>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 
 namespace {
@@ -27,14 +31,23 @@ namespace {
   };
 
   std::string identifier(GVolume* volume) {
+    // The block device comes first: UUIDs repeat across cloned disks and copies of one ISO image.
     for (const auto* kind :
-         {G_VOLUME_IDENTIFIER_KIND_UUID, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE, G_VOLUME_IDENTIFIER_KIND_NFS_MOUNT}) {
+         {G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE, G_VOLUME_IDENTIFIER_KIND_UUID, G_VOLUME_IDENTIFIER_KIND_NFS_MOUNT}) {
       if (const luciole::GString value(g_volume_get_identifier(volume, kind)); value) {
         return value.get();
       }
     }
-    const luciole::GString name(g_volume_get_name(volume));
-    return name ? name.get() : "";
+    static const GQuark kFallbackIdQuark = g_quark_from_static_string("luciole-drive-fallback-id");
+    static std::atomic<std::uint64_t> nextFallbackId{1};
+    auto* id = static_cast<std::uint64_t*>(g_object_get_qdata(G_OBJECT(volume), kFallbackIdQuark));
+    if (id == nullptr) {
+      id = new std::uint64_t(nextFallbackId.fetch_add(1, std::memory_order_relaxed));
+      g_object_set_qdata_full(
+          G_OBJECT(volume), kFallbackIdQuark, id, +[](gpointer data) { delete static_cast<std::uint64_t*>(data); }
+      );
+    }
+    return std::format("object:{}", *id);
   }
 
   std::string_view uriScheme(const luciole::Location& location) {
@@ -70,6 +83,148 @@ namespace {
 
   bool canEjectVolume(GVolume* volume) {
     return volume != nullptr && G_VOLUME_GET_IFACE(volume)->can_eject != nullptr && g_volume_can_eject(volume) != FALSE;
+  }
+
+  using Variant = std::unique_ptr<GVariant, decltype(&g_variant_unref)>;
+  using Bytes = std::unique_ptr<GBytes, decltype(&g_bytes_unref)>;
+
+  std::string_view trimWhitespace(std::string_view text) {
+    while (!text.empty() && g_ascii_isspace(text.front()) != FALSE) {
+      text.remove_prefix(1);
+    }
+    while (!text.empty() && g_ascii_isspace(text.back()) != FALSE) {
+      text.remove_suffix(1);
+    }
+    return text;
+  }
+
+  std::string_view normalizeMountPath(std::string_view path) {
+    while (path.size() > 1 && path.ends_with('/')) {
+      path.remove_suffix(1);
+    }
+    return path;
+  }
+
+  bool containsAsciiCaseInsensitive(std::string_view haystack, std::string_view needle) {
+    return !std::ranges::search(haystack, needle, [](char left, char right) {
+              return g_ascii_tolower(left) == g_ascii_tolower(right);
+            }).empty();
+  }
+
+  bool isBusyUnmountMessage(std::string_view message) {
+    return containsAsciiCaseInsensitive(message, "target is busy")
+        || containsAsciiCaseInsensitive(message, "device is busy")
+        || containsAsciiCaseInsensitive(message, "mount point is busy")
+        || containsAsciiCaseInsensitive(message, "resource busy");
+  }
+
+  bool isPrivilegeUnmountMessage(std::string_view message) {
+    return containsAsciiCaseInsensitive(message, "must be superuser to unmount")
+        || containsAsciiCaseInsensitive(message, "only root can")
+        || containsAsciiCaseInsensitive(message, "operation permitted for root only")
+        || containsAsciiCaseInsensitive(message, "permission denied")
+        || containsAsciiCaseInsensitive(message, "error finding object for block device");
+  }
+
+  std::string bytesToTrimmedUtf8(GBytes* bytes) {
+    if (bytes == nullptr) {
+      return {};
+    }
+    gsize length = 0;
+    const auto* raw = static_cast<const char*>(g_bytes_get_data(bytes, &length));
+    if (raw == nullptr || length == 0) {
+      return {};
+    }
+    const luciole::GString valid(g_utf8_make_valid(raw, static_cast<gssize>(length)));
+    return std::string(trimWhitespace(valid ? std::string_view(valid.get()) : std::string_view{}));
+  }
+
+  // Matches a UDisks2 Filesystem object whose only active mount point is `targetPath`. Multi-mountpoint devices
+  // (such as several mounted Btrfs subvolumes) are skipped so UDisks2 cannot unmount a different mount point.
+  std::optional<std::string> findUdisksFilesystemObject(GVariant* managedObjects, std::string_view targetPath) {
+    if (managedObjects == nullptr || !g_variant_is_of_type(managedObjects, G_VARIANT_TYPE("(a{oa{sa{sv}}})"))) {
+      return std::nullopt;
+    }
+    const auto normalizedTarget = normalizeMountPath(targetPath);
+    const Variant objects(g_variant_get_child_value(managedObjects, 0), g_variant_unref);
+    GVariantIter iter{};
+    g_variant_iter_init(&iter, objects.get());
+    const char* objectPath = nullptr;
+    GVariant* rawInterfaces = nullptr;
+    std::string matched;
+    while (g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &objectPath, &rawInterfaces) != FALSE) {
+      const Variant interfaces(rawInterfaces, g_variant_unref);
+      const Variant filesystem(
+          g_variant_lookup_value(interfaces.get(), "org.freedesktop.UDisks2.Filesystem", G_VARIANT_TYPE("a{sv}")),
+          g_variant_unref
+      );
+      if (!filesystem) {
+        continue;
+      }
+      const Variant mountPoints(
+          g_variant_lookup_value(filesystem.get(), "MountPoints", G_VARIANT_TYPE("aay")), g_variant_unref
+      );
+      if (!mountPoints || g_variant_n_children(mountPoints.get()) != 1) {
+        continue;
+      }
+      const Variant entryPath(g_variant_get_child_value(mountPoints.get(), 0), g_variant_unref);
+      gsize length = 0;
+      const auto* bytes = static_cast<const char*>(g_variant_get_fixed_array(entryPath.get(), &length, sizeof(char)));
+      if (bytes == nullptr) {
+        continue;
+      }
+      std::string_view mounted(bytes, length);
+      while (!mounted.empty() && mounted.back() == '\0') {
+        mounted.remove_suffix(1);
+      }
+      if (normalizeMountPath(mounted) == normalizedTarget) {
+        if (!matched.empty()) {
+          return std::nullopt;
+        }
+        matched = objectPath;
+      }
+    }
+    return matched.empty() ? std::nullopt : std::optional(std::move(matched));
+  }
+
+  // Strips everything up to the mount path so a volume label like "Target is Busy" cannot hijack classification.
+  std::string_view diagnosticTail(std::string_view message, std::string_view mountPath) {
+    const auto normalized = normalizeMountPath(mountPath);
+    if (!normalized.empty()) {
+      if (const auto pos = message.rfind(normalized); pos != std::string_view::npos) {
+        return message.substr(pos + normalized.size());
+      }
+    }
+    return message;
+  }
+
+  // Resolves umount from fixed root-owned system locations rather than the session PATH so pkexec cannot elevate
+  // a user-shadowed wrapper.
+  const char* trustedUmountPath() {
+    static constexpr std::array<const char*, 5> kTrustedPaths{
+        "/usr/bin/umount", "/bin/umount", "/usr/sbin/umount", "/sbin/umount", "/run/wrappers/bin/umount",
+    };
+    for (const auto* path : kTrustedPaths) {
+      struct stat info{};
+      if (::stat(path, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0 && ::access(path, X_OK) == 0) {
+        return path;
+      }
+    }
+    return nullptr;
+  }
+
+  luciole::GioPtr<GSubprocess> spawnWithCLocale(const char* const* argv, GCancellable* cancellable, GError** error) {
+    const luciole::GioPtr<GSubprocessLauncher> launcher(g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDERR_PIPE));
+    g_subprocess_launcher_setenv(launcher.get(), "LC_ALL", "C", TRUE);
+    luciole::GioPtr<GSubprocess> process(g_subprocess_launcher_spawnv(launcher.get(), argv, error));
+    if (process) {
+      g_signal_connect_object(
+          cancellable, "cancelled",
+          G_CALLBACK(+[](GCancellable*, GSubprocess* child) { g_subprocess_force_exit(child); }), process.get(),
+          G_CONNECT_DEFAULT
+      );
+    }
+    return process;
   }
 
   std::string errorText(GError* error) {
@@ -122,6 +277,7 @@ namespace {
 } // namespace
 
 struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
+  struct RemoveRequest;
   // Null until start(): GIO starts the volume-monitor services synchronously.
   GioPtr<GVolumeMonitor> monitor;
   SystemMountMonitor systemMounts;
@@ -130,6 +286,7 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
   std::function<void()> changed;
   std::function<void()> usageChanged;
   std::set<std::string> usagePending;
+  GioPtr<GCancellable> cancellable{g_cancellable_new()};
 
   // "/" leads the list as File System; GIO's volume monitor never reports it.
   void addRoot() {
@@ -346,13 +503,42 @@ struct luciole::DriveMonitor::State : std::enable_shared_from_this<State> {
            .kind = DriveKind::Network}
       );
     }
-    // Mounted entries first within each category, ordered Local -> Removable -> Network; root stays at the top.
-    std::ranges::stable_partition(drives, [](const Drive& drive) { return drive.root.has_value(); });
-    std::ranges::stable_sort(drives, {}, [](const Drive& drive) { return static_cast<std::uint8_t>(drive.kind); });
+    // Group Local -> Removable -> Network, keeping surviving rows in their prior order within each section; root stays
+    // first. Each prior slot matches once so duplicate keys (cloned UUIDs) keep their interleaved order.
+    struct RankedDrive {
+      Drive drive;
+      std::uint8_t kind = 0;
+      std::size_t prior = 0;
+    };
+    std::vector<std::uint8_t> matched(previous.size(), 0);
+    std::vector<RankedDrive> ranked;
+    ranked.reserve(drives.size());
+    for (auto& drive : drives) {
+      std::size_t prior = previous.size();
+      for (std::size_t i = 0; i < previous.size(); ++i) {
+        if (matched[i] == 0 && previous[i].key == drive.key && previous[i].kind == drive.kind) {
+          matched[i] = 1;
+          prior = i;
+          break;
+        }
+      }
+      const auto kind = static_cast<std::uint8_t>(drive.kind);
+      ranked.push_back({.drive = std::move(drive), .kind = kind, .prior = prior});
+    }
+    std::ranges::stable_sort(ranked, {}, [](const RankedDrive& entry) { return std::pair{entry.kind, entry.prior}; });
+    drives.clear();
+    for (auto& entry : ranked) {
+      drives.push_back(std::move(entry.drive));
+    }
     // Keep the last known usage until the next query answers, so bars do not flicker on rebuilds.
     for (auto& drive : drives) {
-      const auto old = std::ranges::find(previous, drive.key, &Drive::key);
-      if (drive.root && old != previous.end() && old->root == drive.root) {
+      if (!drive.root) {
+        continue;
+      }
+      const auto old = std::ranges::find_if(previous, [&](const Drive& prior) {
+        return prior.key == drive.key && prior.root == drive.root;
+      });
+      if (old != previous.end()) {
         drive.usage = old->usage;
       }
     }
@@ -373,6 +559,9 @@ luciole::DriveMonitor::DriveMonitor() : m_state(std::make_shared<State>()) {
 }
 
 luciole::DriveMonitor::~DriveMonitor() {
+  if (m_state->cancellable) {
+    g_cancellable_cancel(m_state->cancellable.get());
+  }
   if (m_state->monitor) {
     g_signal_handlers_disconnect_by_data(m_state->monitor.get(), m_state.get());
   }
@@ -496,45 +685,262 @@ void luciole::DriveMonitor::mount(
   }
 }
 
-void luciole::DriveMonitor::remove(const std::string& key, std::function<void(DriveRemoveResult)> done) {
-  const auto* drive = find(key);
-  const auto handle = m_state->handles.find(key);
-  if (drive == nullptr
-      || handle == m_state->handles.end()
-      || !handle->second.mount
-      || drive->removal == DriveRemoval::None
-      || (drive->removal == DriveRemoval::PowerOff && !handle->second.device)) {
-    done({.error = "This drive can no longer be removed.", .busy = false, .blockers = {}});
-    return;
-  }
-  struct Request {
-    std::weak_ptr<State> state;
-    std::function<void(DriveRemoveResult)> done;
-    DriveRemoval removal = DriveRemoval::None;
-    GioPtr<GMountOperation> operation;
-    DriveRemoveResult result;
-  };
-  auto* request = new Request{
-      .state = m_state,
-      .done = std::move(done),
-      .removal = drive->removal,
-      .operation = GioPtr<GMountOperation>(g_mount_operation_new()),
-      .result = {}
-  };
-  // Files are open on the drive: record who holds them and give up rather than wait or force.
-  const auto busy = +[](GMountOperation* operation, const char*, GArray* processes, const char**, gpointer data) {
-    auto& result = static_cast<Request*>(data)->result;
-    result.busy = true;
-    result.blockers.clear();
-    for (guint i = 0; i < processes->len; ++i) {
-      const int pid = g_array_index(processes, GPid, i);
-      result.blockers.push_back({.pid = pid, .name = processName(pid)});
+// Asynchronous state machine for DriveMonitor::remove: runs GIO first, and on an unprivileged local unmount
+// permission failure escalates through UDisks2 (when a single-mountpoint block filesystem matches) or pkexec.
+struct luciole::DriveMonitor::State::RemoveRequest {
+  std::weak_ptr<State> state;
+  std::function<void(DriveRemoveResult)> done;
+  DriveRemoval removal = DriveRemoval::None;
+  std::string mountPath;
+  bool hasBlockVolume = false;
+  GioPtr<GMountOperation> operation;
+  GioPtr<GCancellable> cancellable;
+  std::string initialError;
+  DriveRemoveResult result;
+
+  void complete() {
+    if (!state.expired()) {
+      done(std::move(result));
     }
-    g_mount_operation_reply(operation, G_MOUNT_OPERATION_ABORTED);
-  };
-  g_signal_connect(request->operation.get(), "show-processes", G_CALLBACK(busy), request);
-  const auto finished = [](GObject* source, GAsyncResult* result, gpointer data) {
-    const std::unique_ptr<Request> request(static_cast<Request*>(data));
+  }
+
+  void cancel() {
+    result.cancelled = true;
+    complete();
+  }
+
+  void failBusy() {
+    result.busy = true;
+    result.error = "The drive is in use.";
+    complete();
+  }
+
+  bool isCancelled(const GError* error) const {
+    return g_cancellable_is_cancelled(cancellable.get()) != FALSE
+        || (error != nullptr && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED) != FALSE);
+  }
+
+  static void startPkexec(std::unique_ptr<RemoveRequest> request) {
+    const char* umountPath = trustedUmountPath();
+    if (umountPath == nullptr) {
+      request->result.error = request->initialError;
+      request->complete();
+      return;
+    }
+    const std::array<const char*, 6> argv{"pkexec", "--disable-internal-agent", umountPath,
+                                          "--",     request->mountPath.c_str(), nullptr};
+    GError* error = nullptr;
+    auto* cancellable = request->cancellable.get();
+    const GioPtr<GSubprocess> process = spawnWithCLocale(argv.data(), cancellable, &error);
+    const GErrorPtr owned(error);
+    if (!process) {
+      request->result.error = !request->initialError.empty()
+          ? request->initialError
+          : (owned && owned->message != nullptr ? owned->message : "Could not request administrator authentication.");
+      request->complete();
+      return;
+    }
+    g_subprocess_communicate_async(process.get(), nullptr, cancellable, onPkexecFinished, request.release());
+  }
+
+  static void onPkexecFinished(GObject* source, GAsyncResult* result, gpointer data) {
+    const std::unique_ptr<RemoveRequest> request(static_cast<RemoveRequest*>(data));
+    GBytes* rawStderr = nullptr;
+    GError* error = nullptr;
+    const bool completed = g_subprocess_communicate_finish(G_SUBPROCESS(source), result, nullptr, &rawStderr, &error);
+    const Bytes stderrBytes(rawStderr, g_bytes_unref);
+    const GErrorPtr owned(error);
+    if (request->state.expired()) {
+      return;
+    }
+    if (request->isCancelled(owned.get())) {
+      request->cancel();
+      return;
+    }
+    auto* subprocess = G_SUBPROCESS(source);
+    if (completed && g_subprocess_get_successful(subprocess) != FALSE) {
+      request->complete();
+      return;
+    }
+    const auto stderrText = bytesToTrimmedUtf8(stderrBytes.get());
+    if (completed && g_subprocess_get_if_exited(subprocess) != FALSE) {
+      const int exitStatus = g_subprocess_get_exit_status(subprocess);
+      // pkexec exits with 126 on prompt dismissal, while util-linux 2.41+ also uses 126 when a mount helper fails.
+      if (exitStatus == 126 && (stderrText.empty() || containsAsciiCaseInsensitive(stderrText, "request dismissed"))) {
+        request->cancel();
+        return;
+      }
+      if (isBusyUnmountMessage(diagnosticTail(stderrText, request->mountPath))) {
+        request->failBusy();
+        return;
+      }
+      if (!stderrText.empty()) {
+        request->result.error = stderrText;
+      } else if (exitStatus == 127) {
+        request->result.error = "Authentication failed.";
+      } else {
+        request->result.error = request->initialError;
+      }
+      request->complete();
+      return;
+    }
+    request->result.error = !stderrText.empty()
+        ? stderrText
+        : (owned && owned->message != nullptr ? owned->message : request->initialError);
+    request->complete();
+  }
+
+  static void onUdisksUnmountFinished(GObject* source, GAsyncResult* result, gpointer data) {
+    const std::unique_ptr<RemoveRequest> request(static_cast<RemoveRequest*>(data));
+    GError* error = nullptr;
+    const Variant reply(g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error), g_variant_unref);
+    const GErrorPtr owned(error);
+    if (request->state.expired()) {
+      return;
+    }
+    if (!owned) {
+      request->complete();
+      return;
+    }
+    if (request->isCancelled(owned.get())) {
+      request->cancel();
+      return;
+    }
+    const GString remote(g_dbus_error_get_remote_error(owned.get()));
+    const std::string_view remoteName = remote ? std::string_view(remote.get()) : std::string_view{};
+    if (remoteName == "org.freedesktop.UDisks2.Error.NotAuthorizedDismissed"
+        || remoteName == "org.freedesktop.UDisks2.Error.Cancelled") {
+      request->cancel();
+      return;
+    }
+    if (remoteName == "org.freedesktop.UDisks2.Error.DeviceBusy") {
+      request->failBusy();
+      return;
+    }
+    if (remoteName == "org.freedesktop.UDisks2.Error.NotMounted") {
+      request->complete();
+      return;
+    }
+    g_dbus_error_strip_remote_error(owned.get());
+    const auto message = trimWhitespace(owned->message != nullptr ? owned->message : "");
+    request->result.error = message.empty() ? request->initialError : std::string(message);
+    request->complete();
+  }
+
+  static void onManagedObjectsReady(GObject* source, GAsyncResult* result, gpointer data) {
+    std::unique_ptr<RemoveRequest> request(static_cast<RemoveRequest*>(data));
+    GError* error = nullptr;
+    const Variant reply(g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error), g_variant_unref);
+    const GErrorPtr owned(error);
+    if (request->state.expired()) {
+      return;
+    }
+    if (request->isCancelled(owned.get())) {
+      request->cancel();
+      return;
+    }
+    const auto objectPath = reply ? findUdisksFilesystemObject(reply.get(), request->mountPath) : std::nullopt;
+    if (!objectPath) {
+      startPkexec(std::move(request));
+      return;
+    }
+    GVariantBuilder options{};
+    g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&options, "{sv}", "auth.no_user_interaction", g_variant_new_boolean(FALSE));
+    auto* bus = G_DBUS_CONNECTION(source);
+    auto* cancellable = request->cancellable.get();
+    g_dbus_connection_call(
+        bus, "org.freedesktop.UDisks2", objectPath->c_str(), "org.freedesktop.UDisks2.Filesystem", "Unmount",
+        g_variant_new("(a{sv})", &options), G_VARIANT_TYPE_UNIT, G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION,
+        G_MAXINT, cancellable, onUdisksUnmountFinished, request.release()
+    );
+  }
+
+  static void onSystemBusReady(GObject*, GAsyncResult* result, gpointer data) {
+    std::unique_ptr<RemoveRequest> request(static_cast<RemoveRequest*>(data));
+    GError* error = nullptr;
+    const GioPtr<GDBusConnection> bus(g_bus_get_finish(result, &error));
+    const GErrorPtr owned(error);
+    if (request->state.expired()) {
+      return;
+    }
+    if (request->isCancelled(owned.get())) {
+      request->cancel();
+      return;
+    }
+    if (!bus) {
+      startPkexec(std::move(request));
+      return;
+    }
+    auto* cancellable = request->cancellable.get();
+    g_dbus_connection_call(
+        bus.get(), "org.freedesktop.UDisks2", "/org/freedesktop/UDisks2", "org.freedesktop.DBus.ObjectManager",
+        "GetManagedObjects", nullptr, G_VARIANT_TYPE("(a{oa{sa{sv}}})"), G_DBUS_CALL_FLAGS_NONE, -1, cancellable,
+        onManagedObjectsReady, request.release()
+    );
+  }
+
+  static void startPrivileged(std::unique_ptr<RemoveRequest> request) {
+    auto* cancellable = request->cancellable.get();
+    g_bus_get(G_BUS_TYPE_SYSTEM, cancellable, onSystemBusReady, request.release());
+  }
+
+  static void onLocaleProbeFinished(GObject* source, GAsyncResult* result, gpointer data) {
+    std::unique_ptr<RemoveRequest> request(static_cast<RemoveRequest*>(data));
+    GBytes* rawStderr = nullptr;
+    GError* error = nullptr;
+    const bool completed = g_subprocess_communicate_finish(G_SUBPROCESS(source), result, nullptr, &rawStderr, &error);
+    const Bytes stderrBytes(rawStderr, g_bytes_unref);
+    const GErrorPtr owned(error);
+    if (request->state.expired()) {
+      return;
+    }
+    if (request->isCancelled(owned.get())) {
+      request->cancel();
+      return;
+    }
+    if (completed && g_subprocess_get_successful(G_SUBPROCESS(source)) != FALSE) {
+      request->complete();
+      return;
+    }
+    const auto stderrText = bytesToTrimmedUtf8(stderrBytes.get());
+    const auto detail = diagnosticTail(stderrText, request->mountPath);
+    if (isBusyUnmountMessage(detail)) {
+      request->failBusy();
+      return;
+    }
+    if (isPrivilegeUnmountMessage(detail)) {
+      startPrivileged(std::move(request));
+      return;
+    }
+    request->result.error = request->initialError;
+    request->complete();
+  }
+
+  // Re-runs unprivileged umount under LC_ALL=C when GIO surfaced a localized umount error, so non-English
+  // sessions still distinguish permission errors from busy targets before requesting authorization.
+  static void startLocaleProbe(std::unique_ptr<RemoveRequest> request) {
+    const char* umountPath = trustedUmountPath();
+    if (umountPath == nullptr) {
+      request->result.error = request->initialError;
+      request->complete();
+      return;
+    }
+    const std::array<const char*, 4> argv{umountPath, "--", request->mountPath.c_str(), nullptr};
+    GError* error = nullptr;
+    auto* cancellable = request->cancellable.get();
+    const GioPtr<GSubprocess> process = spawnWithCLocale(argv.data(), cancellable, &error);
+    const GErrorPtr owned(error);
+    if (!process) {
+      request->result.error = request->initialError;
+      request->complete();
+      return;
+    }
+    g_subprocess_communicate_async(process.get(), nullptr, cancellable, onLocaleProbeFinished, request.release());
+  }
+
+  static void onGioFinished(GObject* source, GAsyncResult* result, gpointer data) {
+    std::unique_ptr<RemoveRequest> request(static_cast<RemoveRequest*>(data));
     g_signal_handlers_disconnect_by_data(request->operation.get(), request.get());
     GError* error = nullptr;
     switch (request->removal) {
@@ -549,33 +955,117 @@ void luciole::DriveMonitor::remove(const std::string& key, std::function<void(Dr
       (void)g_mount_unmount_with_operation_finish(G_MOUNT(source), result, &error);
       break;
     }
-    if (error != nullptr && error->domain == G_IO_ERROR && error->code == G_IO_ERROR_BUSY) {
-      request->result.busy = true;
+    const GErrorPtr owned(error);
+    const auto state = request->state.lock();
+    if (!state) {
+      return;
     }
-    auto message = errorText(error);
-    if (!message.empty() && !request->result.busy) {
-      request->result.error = std::move(message);
-    } else if (request->result.busy) {
-      request->result.error = "The drive is in use.";
+    if (!owned) {
+      request->complete();
+      return;
     }
-    if (!request->state.expired()) {
-      request->done(std::move(request->result));
+    if (request->result.busy || g_error_matches(owned.get(), G_IO_ERROR, G_IO_ERROR_BUSY)) {
+      request->failBusy();
+      return;
     }
+    if (g_error_matches(owned.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED)
+        || g_error_matches(owned.get(), G_IO_ERROR, G_IO_ERROR_FAILED_HANDLED)) {
+      request->cancel();
+      return;
+    }
+    auto message = std::string(trimWhitespace(owned->message != nullptr ? owned->message : ""));
+    const auto detail = diagnosticTail(message, request->mountPath);
+    if (isBusyUnmountMessage(detail)) {
+      request->failBusy();
+      return;
+    }
+    request->initialError = message;
+    const bool canFallback = request->removal == DriveRemoval::Unmount
+        && !request->mountPath.empty()
+        && owned->domain == G_IO_ERROR
+        && (owned->code == G_IO_ERROR_FAILED
+            || (owned->code == G_IO_ERROR_PERMISSION_DENIED && !request->hasBlockVolume));
+    if (canFallback) {
+      if ((owned->code == G_IO_ERROR_PERMISSION_DENIED && !request->hasBlockVolume)
+          || isPrivilegeUnmountMessage(detail)) {
+        startPrivileged(std::move(request));
+        return;
+      }
+      if (!request->hasBlockVolume
+          && owned->code == G_IO_ERROR_FAILED
+          && mountedFilesystemAt(request->mountPath, state->systemMounts.mountedFilesystems()) != nullptr) {
+        startLocaleProbe(std::move(request));
+        return;
+      }
+    }
+    request->result.error = std::move(message);
+    request->complete();
+  }
+};
+
+void luciole::DriveMonitor::remove(const std::string& key, std::function<void(DriveRemoveResult)> done) {
+  const auto* drive = find(key);
+  const auto handle = m_state->handles.find(key);
+  if (drive == nullptr
+      || handle == m_state->handles.end()
+      || !handle->second.mount
+      || drive->removal == DriveRemoval::None
+      || (drive->removal == DriveRemoval::PowerOff && !handle->second.device)) {
+    done({.error = "This drive can no longer be removed.", .busy = false, .cancelled = false, .blockers = {}});
+    return;
+  }
+  const auto nativePath = drive->root && drive->root->isNative() ? drive->root->nativePath() : std::nullopt;
+  const GString unixDevice(
+      handle->second.volume ? g_volume_get_identifier(handle->second.volume.get(), G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE)
+                            : nullptr
+  );
+  const std::string_view mountType = G_OBJECT_TYPE_NAME(handle->second.mount.get());
+  const bool hasBlockVolume =
+      handle->second.volume && !handle->second.systemMount && unixDevice && mountType != "GUnixMount";
+
+  auto request = std::make_unique<State::RemoveRequest>(State::RemoveRequest{
+      .state = m_state,
+      .done = std::move(done),
+      .removal = drive->removal,
+      .mountPath = nativePath.value_or(std::string{}),
+      .hasBlockVolume = hasBlockVolume,
+      .operation = GioPtr<GMountOperation>(g_mount_operation_new()),
+      .cancellable = GioPtr<GCancellable>(G_CANCELLABLE(g_object_ref(m_state->cancellable.get()))),
+      .initialError = {},
+      .result = {}
+  });
+  // Files are open on the drive: record who holds them and give up rather than wait or force.
+  const auto busy = +[](GMountOperation* operation, const char*, GArray* processes, const char**, gpointer data) {
+    auto& result = static_cast<State::RemoveRequest*>(data)->result;
+    result.busy = true;
+    result.blockers.clear();
+    for (guint i = 0; i < processes->len; ++i) {
+      const int pid = g_array_index(processes, GPid, i);
+      result.blockers.push_back({.pid = pid, .name = processName(pid)});
+    }
+    g_mount_operation_reply(operation, G_MOUNT_OPERATION_ABORTED);
   };
   auto* operation = request->operation.get();
+  auto* cancellable = request->cancellable.get();
+  g_signal_connect(operation, "show-processes", G_CALLBACK(busy), request.get());
   switch (drive->removal) {
   case DriveRemoval::PowerOff:
-    g_drive_stop(handle->second.device.get(), G_MOUNT_UNMOUNT_NONE, operation, nullptr, finished, request);
+    g_drive_stop(
+        handle->second.device.get(), G_MOUNT_UNMOUNT_NONE, operation, cancellable, State::RemoveRequest::onGioFinished,
+        request.release()
+    );
     break;
   case DriveRemoval::Eject:
     g_mount_eject_with_operation(
-        handle->second.mount.get(), G_MOUNT_UNMOUNT_NONE, operation, nullptr, finished, request
+        handle->second.mount.get(), G_MOUNT_UNMOUNT_NONE, operation, cancellable, State::RemoveRequest::onGioFinished,
+        request.release()
     );
     break;
   case DriveRemoval::Unmount:
   case DriveRemoval::None:
     g_mount_unmount_with_operation(
-        handle->second.mount.get(), G_MOUNT_UNMOUNT_NONE, operation, nullptr, finished, request
+        handle->second.mount.get(), G_MOUNT_UNMOUNT_NONE, operation, cancellable, State::RemoveRequest::onGioFinished,
+        request.release()
     );
     break;
   }

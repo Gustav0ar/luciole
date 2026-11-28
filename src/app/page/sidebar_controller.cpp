@@ -251,7 +251,7 @@ void SidebarController::removeDrive(const std::string& key) {
           return;
         }
         m_removingDrive = false;
-        if (result.error.empty()) {
+        if (result.cancelled || result.error.empty()) {
           return;
         }
         if (!result.busy) {

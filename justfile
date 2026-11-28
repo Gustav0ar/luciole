@@ -239,6 +239,10 @@ role-alpha-check:
 lint-python:
     just _files python | xargs -0 -r python3 -m py_compile
 
+# Regressions for the GitHub workflow scripts. Pure Python, builds nothing.
+test-workflows:
+    python3 -m unittest discover -s .github/workflows/scripts -p 'test_*.py'
+
 [arg("m", pattern="debug|release|asan")]
 fix m=mode: (_ensure-configured m)
     meson compile -C "build-$1" luciole
